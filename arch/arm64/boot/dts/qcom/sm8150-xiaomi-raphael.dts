@@ -56,11 +56,11 @@
 		device-chemistry = "lithium-ion-polymer";
 
 		/*
-		 * Keep the maximum charging current conservative for now,
-		 * until we have thermal handling in the charging driver.
-		 * Downstream seems to have a upper limit of 3A.
+		 * Android: qcom,usb-icl-ua=2.8A, qcom,fcc-max-ua=5.1A (with SMB1390 CP).
+		 * Without charge pump: FCC capped at 3A (~15–18W at 9V PD).
+		 * With SMB1390 active, qcom_smbx raises FCC to min(2×ICL, 5.1A).
 		 */
-		constant-charge-current-max-microamp = <1500000>;
+		constant-charge-current-max-microamp = <3000000>;
 
 		charge-full-design-microamp-hours = <4000000>;
 		voltage-min-design-microvolt = <3400000>;
@@ -613,6 +613,23 @@
 	};
 };
 
+/*
+ * APPS_I2C (GPIO51/52 qup4) — Android qupv3_se4. SMB1390 charge pump @ 0x10.
+ */
+&i2c4 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	smb1390: charger@10 {
+		compatible = "qcom,smb1390-charger";
+		reg = <0x10>;
+		interrupt-parent = <&pm8150b_gpios>;
+		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+		qcom,primary-charger = <&pm8150b_charger>;
+		status = "okay";
+	};
+};
+
 &ipa {
 	status = "okay";
 	qcom,gsi-loader = "self";
@@ -699,10 +716,18 @@
 		source-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE |
 			       PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)>;
 
+		/*
+		 * Advertise PD sink capabilities matching stock 27W hardware intent:
+		 * 5V/3A, 9V/3A, and PPS 5–11V@3A. Without SMB1390 charge pump,
+		 * PM8150B will typically settle around 9V × ~2–3A (~18–20W).
+		 * Xiaomi proprietary QC3→CP path still needs SMB1390 + HVDCP.
+		 */
 		sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE |
-			       PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)>;
+				      PDO_FIXED_USB_COMM | PDO_FIXED_DATA_SWAP)
+			     PDO_FIXED(9000, 3000, 0)
+			     PDO_PPS_APDO(5000, 11000, 3000)>;
 
-		op-sink-microwatt = <10000000>;
+		op-sink-microwatt = <15000000>;
 
 		ports {
 			#address-cells = <1>;
@@ -721,13 +746,13 @@
 &pm8150b_fg {
 	status = "okay";
 	monitored-battery = <&battery>;
-	power-supplies = <&pm8150b_charger>;
-	//power-supplies = <&ln8000_charger>;
+	power-supplies = <&pm8150b_charger>, <&smb1390>;
 };
 
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
+	qcom,charge-pump = <&smb1390>;
 };
 
 &pm8150b_vbus {

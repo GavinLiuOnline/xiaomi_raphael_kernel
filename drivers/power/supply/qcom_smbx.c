@@ -9,17 +9,23 @@
  */
 
 #include <linux/bits.h>
+#include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -105,11 +111,12 @@ enum smb_generation {
 #define FACTORY_MODE_DETECTION_EN_BIT			BIT(5)
 #define VCONN_OC_CFG_BIT				BIT(1)
 
+#define USBIN_ADAPTER_ALLOW_CFG				0x360
 #define USBIN_OPTIONS_1_CFG				0x362
 #define AUTO_SRC_DETECT_BIT				BIT(3)
 #define HVDCP_EN_BIT					BIT(2)
 
-#define USBIN_LOAD_CFG					0x65
+#define USBIN_LOAD_CFG					0x365
 #define ICL_OVERRIDE_AFTER_APSD_BIT			BIT(4)
 
 #define USBIN_ICL_OPTIONS				0x366
@@ -192,10 +199,27 @@ enum smb_generation {
 #define STAT_CFG					0x690
 #define STAT_SW_OVERRIDE_CFG_BIT			BIT(6)
 
+/*
+ * PM8150B MISC (absolute 0x16xx) accessed as charger@1000 + offset.
+ * MISC_SMB_CFG @ 0x1690 shares the same relative offset as SMB2 STAT_CFG.
+ */
+#define MISC_SMB_EN_CMD					0x648
+#define EN_CP_CMD_BIT					BIT(0)
+#define EN_STAT_CMD_BIT					BIT(2)
+
+#define MISC_SMB_CFG					0x690
+#define SMB_EN_SEL_BIT					BIT(4)
+
 #define SDP_CURRENT_UA					500000
 #define CDP_CURRENT_UA					1500000
 #define DCP_CURRENT_UA					1500000
 #define CURRENT_MAX_UA					DCP_CURRENT_UA
+/* Align with Android Raphael qcom,usb-icl-ua */
+#define USB_ICL_MAX_UA					2800000
+/* Android qcom,fcc-max-ua when charge pump is active */
+#define FCC_CP_MAX_UA					5100000
+/* Enable SMB1390 when negotiated Vbus is at least 9V */
+#define CP_MIN_VBUS_UV					9000000
 
 /* pmi8998 registers represent current in increments of 1/40th of an amp */
 #define CURRENT_SCALE_FACTOR				25000
@@ -231,6 +255,12 @@ struct smb_init_register {
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @chg_psy:		Charger power supply instance
+ * @cp_psy:		Optional SMB1390 charge-pump supply
+ * @nb:			Notifier for TCPM / charge-pump psy changes
+ * @lock:		Protects ICL/FCC/CP coordination
+ * @pd_icl_ua:		Negotiated PD input current (0 = use APSD)
+ * @pd_vbus_uv:		Negotiated PD voltage
+ * @cp_enabled:		Charge-pump path currently requested
  */
 struct smb_chip {
 	struct device *dev;
@@ -248,6 +278,13 @@ struct smb_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+	struct power_supply *cp_psy;
+	struct notifier_block nb;
+	struct mutex lock;
+
+	unsigned int pd_icl_ua;
+	unsigned int pd_vbus_uv;
+	bool cp_enabled;
 };
 
 struct smb_match_data {
@@ -433,56 +470,341 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			    val_raw);
 }
 
-static void smb_status_change_work(struct work_struct *work)
+static int smb_set_fcc(struct smb_chip *chip, unsigned int ua)
+{
+	if (ua > FCC_CP_MAX_UA)
+		ua = FCC_CP_MAX_UA;
+
+	return regmap_write(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
+			    ua / CURRENT_SCALE_FACTOR);
+}
+
+static unsigned int smb_default_fcc_ua(struct smb_chip *chip)
+{
+	int ua = chip->batt_info->constant_charge_current_max_ua;
+
+	if (ua <= 0 || ua == -EINVAL)
+		return 1950000;
+
+	return ua;
+}
+
+static int smb_cp_hw_enable(struct smb_chip *chip, bool enable)
+{
+	int rc;
+
+	if (chip->gen != SMB5)
+		return 0;
+
+	if (enable) {
+		rc = regmap_update_bits(chip->regmap, chip->base + MISC_SMB_CFG,
+					SMB_EN_SEL_BIT, SMB_EN_SEL_BIT);
+		if (rc)
+			return rc;
+
+		return regmap_update_bits(chip->regmap,
+					  chip->base + MISC_SMB_EN_CMD,
+					  EN_CP_CMD_BIT, EN_CP_CMD_BIT);
+	}
+
+	rc = regmap_update_bits(chip->regmap, chip->base + MISC_SMB_EN_CMD,
+				EN_CP_CMD_BIT, 0);
+	if (rc)
+		return rc;
+
+	return regmap_update_bits(chip->regmap, chip->base + MISC_SMB_CFG,
+				  SMB_EN_SEL_BIT, 0);
+}
+
+static void smb_resolve_cp_psy(struct smb_chip *chip)
+{
+	if (chip->cp_psy)
+		return;
+
+	chip->cp_psy = power_supply_get_by_reference(dev_fwnode(chip->dev),
+						     "qcom,charge-pump");
+	if (IS_ERR(chip->cp_psy))
+		chip->cp_psy = NULL;
+
+	if (!chip->cp_psy)
+		chip->cp_psy = power_supply_get_by_name("smb1390-charger");
+}
+
+static void smb_notify_cp(struct smb_chip *chip, bool enable, unsigned int icl_ua)
+{
+	union power_supply_propval val;
+	int rc;
+
+	smb_resolve_cp_psy(chip);
+	if (!chip->cp_psy)
+		return;
+
+	if (enable && icl_ua) {
+		val.intval = icl_ua;
+		rc = power_supply_set_property(chip->cp_psy,
+					       POWER_SUPPLY_PROP_CURRENT_MAX,
+					       &val);
+		if (rc)
+			dev_dbg(chip->dev, "CP CURRENT_MAX set failed: %d\n",
+				rc);
+	}
+
+	val.intval = enable;
+	rc = power_supply_set_property(chip->cp_psy, POWER_SUPPLY_PROP_ONLINE,
+				       &val);
+	if (rc)
+		dev_dbg(chip->dev, "CP ONLINE set failed: %d\n", rc);
+
+	power_supply_changed(chip->cp_psy);
+}
+
+static void smb_update_charge_pump(struct smb_chip *chip, unsigned int icl_ua)
+{
+	bool want_cp;
+	unsigned int fcc_ua, vbus_uv;
+	int rc;
+
+	/* Use PD contract voltage, or read actual VBUS for HVDCP */
+	if (chip->pd_vbus_uv >= CP_MIN_VBUS_UV) {
+		vbus_uv = chip->pd_vbus_uv;
+	} else {
+		rc = iio_read_channel_processed(chip->usb_in_v_chan, (int *)&vbus_uv);
+		if (rc)
+			vbus_uv = 0;
+	}
+
+	want_cp = chip->gen == SMB5 && vbus_uv >= CP_MIN_VBUS_UV &&
+		  icl_ua >= 900000;
+
+	if (want_cp == chip->cp_enabled && !want_cp)
+		return;
+
+	if (want_cp) {
+		rc = smb_cp_hw_enable(chip, true);
+		if (rc) {
+			dev_err(chip->dev, "Failed to enable SMB_EN: %d\n", rc);
+			return;
+		}
+
+		fcc_ua = min_t(unsigned int, icl_ua * 2, FCC_CP_MAX_UA);
+		smb_set_fcc(chip, fcc_ua);
+		smb_notify_cp(chip, true, icl_ua);
+		chip->cp_enabled = true;
+		dev_info(chip->dev,
+			 "Charge pump requested (Vbus=%u uV ICL=%u uA FCC=%u uA)\n",
+			 vbus_uv, icl_ua, fcc_ua);
+	} else if (chip->cp_enabled) {
+		smb_notify_cp(chip, false, 0);
+		smb_cp_hw_enable(chip, false);
+		smb_set_fcc(chip, smb_default_fcc_ua(chip));
+		chip->cp_enabled = false;
+		dev_info(chip->dev, "Charge pump disabled\n");
+	}
+}
+
+static unsigned int smb_apsd_icl_ua(struct smb_chip *chip, unsigned int type)
+{
+	switch (type) {
+	case POWER_SUPPLY_USB_TYPE_CDP:
+		return CDP_CURRENT_UA;
+	case POWER_SUPPLY_USB_TYPE_DCP:
+		return min_t(unsigned int,
+			     chip->batt_info->constant_charge_current_max_ua,
+			     USB_ICL_MAX_UA);
+	case POWER_SUPPLY_USB_TYPE_SDP:
+	default:
+		return SDP_CURRENT_UA;
+	}
+}
+
+static void smb_apply_input_limits(struct smb_chip *chip)
 {
 	unsigned int charger_type, current_ua;
 	int usb_online = 0;
 	int count, rc;
-	struct smb_chip *chip;
 
-	chip = container_of(work, struct smb_chip, status_change_work.work);
+	mutex_lock(&chip->lock);
 
 	smb_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
-		return;
-
-	for (count = 0; count < 3; count++) {
-		dev_dbg(chip->dev, "get charger type retry %d\n", count);
-		rc = smb_apsd_get_charger_type(chip, &charger_type);
-		if (rc != -EAGAIN)
-			break;
-		msleep(100);
-	}
-
-	if (rc < 0 && rc != -EAGAIN) {
-		dev_err(chip->dev, "get charger type failed: %d\n", rc);
-		return;
-	}
-
-	if (rc < 0) {
-		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
-					APSD_RERUN_BIT, APSD_RERUN_BIT);
-		schedule_delayed_work(&chip->status_change_work,
-				      msecs_to_jiffies(1000));
-		dev_dbg(chip->dev, "get charger type failed, rerun apsd\n");
+	if (!usb_online) {
+		chip->pd_icl_ua = 0;
+		chip->pd_vbus_uv = 0;
+		smb_update_charge_pump(chip, 0);
+		/* Reset to safe defaults on disconnect */
+		regmap_update_bits(chip->regmap,
+				   chip->base + USBIN_ADAPTER_ALLOW_CFG,
+				   0x0f, 0);
+		regmap_write(chip->regmap,
+			  chip->base + CMD_ICL_OVERRIDE, 0);
+		/* Disable HVDCP when disconnected */
+		regmap_update_bits(chip->regmap,
+				   chip->base + USBIN_OPTIONS_1_CFG,
+				   HVDCP_EN_BIT, 0);
+		mutex_unlock(&chip->lock);
 		return;
 	}
 
-	switch (charger_type) {
-	case POWER_SUPPLY_USB_TYPE_CDP:
-		current_ua = CDP_CURRENT_UA;
-		break;
-	case POWER_SUPPLY_USB_TYPE_DCP:
-		current_ua = chip->batt_info->constant_charge_current_max_ua;
-		break;
-	case POWER_SUPPLY_USB_TYPE_SDP:
-	default:
-		current_ua = SDP_CURRENT_UA;
-		break;
+	if (chip->pd_icl_ua) {
+		current_ua = min_t(unsigned int, chip->pd_icl_ua, USB_ICL_MAX_UA);
+		/* PD contract active: allow up to 9V input and force software ICL */
+		regmap_update_bits(chip->regmap,
+				   chip->base + USBIN_ADAPTER_ALLOW_CFG,
+				   0x0f, 8);
+		regmap_write(chip->regmap,
+			  chip->base + CMD_ICL_OVERRIDE,
+			  ICL_OVERRIDE_BIT);
+	} else {
+		/* Enable HVDCP (QC3.0) for non-PD fast charging */
+		regmap_update_bits(chip->regmap,
+				   chip->base + USBIN_OPTIONS_1_CFG,
+				   HVDCP_EN_BIT, HVDCP_EN_BIT);
+		for (count = 0; count < 3; count++) {
+			rc = smb_apsd_get_charger_type(chip, &charger_type);
+			if (rc != -EAGAIN)
+				break;
+			msleep(100);
+		}
+
+		if (rc < 0 && rc != -EAGAIN) {
+			dev_err(chip->dev, "get charger type failed: %d\n", rc);
+			mutex_unlock(&chip->lock);
+			return;
+		}
+
+		if (rc < 0) {
+			/*
+			 * APSD not ready (common on PD-only chargers that
+			 * don't respond to BC1.2). Set a safe fallback ICL
+			 * so we get reasonable current while PD negotiates.
+			 * Enable ICL_OVERRIDE so the software limit takes
+			 * effect instead of AICL reducing it. Also allow
+			 * up to 9V in case PD is still negotiating.
+			 */
+			current_ua = USB_ICL_MAX_UA;
+			dev_info(chip->dev,
+				 "APSD not ready, fallback ICL=%u uA\n",
+				 current_ua);
+			smb_set_current_limit(chip, current_ua);
+			regmap_update_bits(chip->regmap,
+					   chip->base + USBIN_ADAPTER_ALLOW_CFG,
+					   0x0f, 8);
+			regmap_write(chip->regmap,
+			  chip->base + CMD_ICL_OVERRIDE,
+			  ICL_OVERRIDE_BIT);
+			regmap_update_bits(chip->regmap,
+					   chip->base + CMD_APSD,
+					   APSD_RERUN_BIT, APSD_RERUN_BIT);
+			if (!chip->cp_enabled)
+				smb_set_fcc(chip, smb_default_fcc_ua(chip));
+			smb_update_charge_pump(chip, current_ua);
+			mutex_unlock(&chip->lock);
+			power_supply_changed(chip->chg_psy);
+			return;
+		} else {
+			current_ua = smb_apsd_icl_ua(chip, charger_type);
+			/*
+			 * Force ICL_OVERRIDE so AICL can't reduce current
+			 * when VBUS drops slightly due to cable resistance.
+			 * Also allow up to 9V for HVDCP negotiation.
+			 */
+			regmap_write(chip->regmap,
+			  chip->base + CMD_ICL_OVERRIDE,
+			  ICL_OVERRIDE_BIT);
+			regmap_update_bits(chip->regmap,
+					   chip->base + USBIN_ADAPTER_ALLOW_CFG,
+					   0x0f, 8);
+		}
 	}
 
 	smb_set_current_limit(chip, current_ua);
+
+	if (!chip->cp_enabled)
+		smb_set_fcc(chip, smb_default_fcc_ua(chip));
+
+	smb_update_charge_pump(chip, current_ua);
+	mutex_unlock(&chip->lock);
+
 	power_supply_changed(chip->chg_psy);
+}
+
+static void smb_status_change_work(struct work_struct *work)
+{
+	struct smb_chip *chip;
+
+	chip = container_of(work, struct smb_chip, status_change_work.work);
+	smb_apply_input_limits(chip);
+}
+
+static bool smb_psy_is_tcpm(struct power_supply *psy)
+{
+	const char *name;
+
+	if (!psy || !psy->desc || !psy->desc->name)
+		return false;
+
+	name = psy->desc->name;
+	return !strncmp(name, "tcpm-source-psy-", 16);
+}
+
+static int smb_read_tcpm_contract(struct smb_chip *chip, struct power_supply *psy)
+{
+	union power_supply_propval volt = { 0 }, curr = { 0 };
+	int rc;
+
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &volt);
+	if (rc || !volt.intval) {
+		chip->pd_icl_ua = 0;
+		chip->pd_vbus_uv = 0;
+		return 0;
+	}
+
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+				       &volt);
+	if (rc)
+		return rc;
+
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_MAX,
+				       &curr);
+	if (rc)
+		return rc;
+
+	chip->pd_vbus_uv = volt.intval;
+	chip->pd_icl_ua = curr.intval;
+	return 0;
+}
+
+static int smb_notifier_call(struct notifier_block *nb, unsigned long event,
+			     void *data)
+{
+	struct smb_chip *chip = container_of(nb, struct smb_chip, nb);
+	struct power_supply *psy = data;
+
+	if (event != PSY_EVENT_PROP_CHANGED)
+		return NOTIFY_DONE;
+
+	if (smb_psy_is_tcpm(psy)) {
+		mutex_lock(&chip->lock);
+		smb_read_tcpm_contract(chip, psy);
+		mutex_unlock(&chip->lock);
+		schedule_delayed_work(&chip->status_change_work,
+				      msecs_to_jiffies(100));
+		return NOTIFY_OK;
+	}
+
+	if (chip->cp_psy && psy == chip->cp_psy) {
+		schedule_delayed_work(&chip->status_change_work, 0);
+		return NOTIFY_OK;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static void smb_external_power_changed(struct power_supply *psy)
+{
+	struct smb_chip *chip = power_supply_get_drvdata(psy);
+
+	schedule_delayed_work(&chip->status_change_work,
+			      msecs_to_jiffies(100));
 }
 
 static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
@@ -722,89 +1044,93 @@ static const struct power_supply_desc smb_psy_desc = {
 	.get_property = smb_get_property,
 	.set_property = smb_set_property,
 	.property_is_writeable = smb_property_is_writable,
+	.external_power_changed = smb_external_power_changed,
 };
 
 /* Init sequence derived from vendor downstream driver */
 static const struct smb_init_register smb5_init_seq[] = {
-	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
-	/*
-	 * By default configure us as an upstream facing port
-	 * FIXME: This will be handled by the type-c driver
-	 */
-	{ .addr = SMB5_TYPE_C_MODE_CFG,
-	  .mask = SMB5_EN_TRY_SNK_BIT | SMB5_EN_SNK_ONLY_BIT,
-	  .val = SMB5_EN_TRY_SNK_BIT },
-	{ .addr = SMB5_TYPEC_TYPE_C_VCONN_CONTROL,
-	  .mask = SMB5_VCONN_EN_ORIENTATION_BIT | SMB5_VCONN_EN_SRC_BIT |
-		  SMB5_VCONN_EN_VALUE_BIT,
-	  .val = SMB2_VCONN_EN_SRC_BIT },
-	{ .addr = SMB5_DEBUG_ACCESS_SRC_CFG,
-	  .mask = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT,
-	  .val = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT },
-	{ .addr = SMB5_TYPE_C_EXIT_STATE_CFG,
-	  .mask = SMB5_SEL_SRC_UPPER_REF_BIT,
-	  .val = SMB5_SEL_SRC_UPPER_REF_BIT },
-	/*
-	 * Disable Type-C factory mode and stay in Attached.SRC state when VCONN
-	 * over-current happens
-	 */
-	{ .addr = TYPE_C_CFG,
-	  .mask = APSD_START_ON_CC_BIT,
-	  .val = 0 },
-	{ .addr = SMB5_TYPE_C_DEBUG_ACCESS_SINK,
-	  .mask = SMB5_TYPEC_DEBUG_ACCESS_SINK_MASK,
-	  .val = 0x17 },
-	/* Configure VBUS for software control */
-	{ .addr = OTG_CFG, .mask = OTG_EN_SRC_CFG_BIT, .val = 0 },
-	/*
-	 * Recharge when State Of Charge drops below 98%.
-	 */
-	{ .addr = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
-	  .mask = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
-	  .val = 250 },
-	/* Enable charging */
-	{ .addr = CHARGING_ENABLE_CMD,
-	  .mask = CHARGING_ENABLE_CMD_BIT,
-	  .val = CHARGING_ENABLE_CMD_BIT },
-	/* Enable BC1P2 auto Src detect */
-	{ .addr = USBIN_OPTIONS_1_CFG,
-	  .mask = AUTO_SRC_DETECT_BIT,
-	  .val = AUTO_SRC_DETECT_BIT },
-	/* Set the default SDP charger type to a 500ma USB 2.0 port */
-	{ .addr = USBIN_ICL_OPTIONS,
-	  .mask = USBIN_MODE_CHG_BIT,
-	  .val = USBIN_MODE_CHG_BIT },
-	{ .addr = CMD_ICL_OVERRIDE,
-	  .mask = ICL_OVERRIDE_BIT,
-	  .val = 0 },
-	{ .addr = USBIN_LOAD_CFG,
-	  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
-	  .val = 0 },
-	/* Disable watchdog */
-	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
-	{ .addr = WD_CFG,
-	  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
-		  BARK_WDOG_INT_EN_BIT,
-	  .val = 0 },
-	/*
-	 * Enable Automatic Input Current Limit, this will slowly ramp up the current
-	 * When connected to a wall charger, and automatically stop when it detects
-	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
-	 */
-	{ .addr = USBIN_AICL_OPTIONS_CFG,
-	  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
-			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT,
-	  .val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
-			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT },
-	/*
-	 * This overrides all of the other current limit configs and is
-	 * expected to be used for setting limits based on temperature.
-	 * We set some relatively safe default value while still allowing
-	 * a comfortably fast charging rate.
-	 */
-	{ .addr = FAST_CHARGE_CURRENT_CFG,
-	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
-	  .val = 1950000 / CURRENT_SCALE_FACTOR },
+{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
+/*
+ * By default configure us as an upstream facing port
+ * FIXME: This will be handled by the type-c driver
+ */
+{ .addr = SMB5_TYPE_C_MODE_CFG,
+  .mask = SMB5_EN_TRY_SNK_BIT | SMB5_EN_SNK_ONLY_BIT,
+  .val = SMB5_EN_TRY_SNK_BIT },
+{ .addr = SMB5_TYPEC_TYPE_C_VCONN_CONTROL,
+  .mask = SMB5_VCONN_EN_ORIENTATION_BIT | SMB5_VCONN_EN_SRC_BIT |
+  SMB5_VCONN_EN_VALUE_BIT,
+  .val = SMB2_VCONN_EN_SRC_BIT },
+{ .addr = SMB5_DEBUG_ACCESS_SRC_CFG,
+  .mask = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT,
+  .val = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT },
+{ .addr = SMB5_TYPE_C_EXIT_STATE_CFG,
+  .mask = SMB5_SEL_SRC_UPPER_REF_BIT,
+  .val = SMB5_SEL_SRC_UPPER_REF_BIT },
+/*
+ * Disable Type-C factory mode and stay in Attached.SRC state when VCONN
+ * over-current happens
+ */
+{ .addr = TYPE_C_CFG,
+  .mask = APSD_START_ON_CC_BIT,
+  .val = 0 },
+{ .addr = SMB5_TYPE_C_DEBUG_ACCESS_SINK,
+  .mask = SMB5_TYPEC_DEBUG_ACCESS_SINK_MASK,
+  .val = 0x17 },
+/* Configure VBUS for software control */
+{ .addr = OTG_CFG, .mask = OTG_EN_SRC_CFG_BIT, .val = 0 },
+/*
+ * Recharge when State Of Charge drops below 98%.
+ */
+{ .addr = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
+  .mask = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
+  .val = 250 },
+/* Enable charging */
+{ .addr = CHARGING_ENABLE_CMD,
+  .mask = CHARGING_ENABLE_CMD_BIT,
+  .val = CHARGING_ENABLE_CMD_BIT },
+/* Enable BC1P2 auto Src detect and HVDCP (QC3.0) handshake */
+{ .addr = USBIN_OPTIONS_1_CFG,
+  .mask = AUTO_SRC_DETECT_BIT | HVDCP_EN_BIT,
+  .val = AUTO_SRC_DETECT_BIT | HVDCP_EN_BIT },
+/* Set the default SDP charger type to a 500ma USB 2.0 port */
+{ .addr = USBIN_ICL_OPTIONS,
+  .mask = USBIN_MODE_CHG_BIT,
+  .val = USBIN_MODE_CHG_BIT },
+{ .addr = CMD_ICL_OVERRIDE,
+  .mask = ICL_OVERRIDE_BIT,
+  .val = ICL_OVERRIDE_BIT },
+{ .addr = USBIN_CURRENT_LIMIT_CFG,
+  .mask = 0xff,
+  .val = 3000000 / CURRENT_SCALE_FACTOR },
+{ .addr = USBIN_LOAD_CFG,
+  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
+  .val = ICL_OVERRIDE_AFTER_APSD_BIT },
+/* Disable watchdog */
+{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
+{ .addr = WD_CFG,
+  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
+  BARK_WDOG_INT_EN_BIT,
+  .val = 0 },
+/*
+ * This overrides all of the other current limit configs and is
+ * expected to be used for setting limits based on temperature.
+ * We set some relatively safe default value while still allowing
+ * a comfortably fast charging rate.
+ */
+{ .addr = FAST_CHARGE_CURRENT_CFG,
+  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
+  .val = 1950000 / CURRENT_SCALE_FACTOR },
+/*
+ * Enable Automatic Input Current Limit, this will slowly ramp up the current
+ * When connected to a wall charger, and automatically stop when it detects
+ * the charger current limit (voltage drop?) or it reaches the programmed limit.
+ */
+{ .addr = USBIN_AICL_OPTIONS_CFG,
+  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT |
+	  USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT |
+	  USBIN_AICL_START_AT_MAX_BIT,
+  .val = USBIN_AICL_ADC_EN_BIT },
 };
 
 /* Init sequence derived from vendor downstream driver */
@@ -1044,6 +1370,8 @@ static int smb_probe(struct platform_device *pdev)
 	if (chip->batt_info->constant_charge_current_max_ua == -EINVAL)
 		chip->batt_info->constant_charge_current_max_ua = DCP_CURRENT_UA;
 
+	mutex_init(&chip->lock);
+
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
 					  smb_status_change_work);
 	if (rc)
@@ -1082,15 +1410,10 @@ static int smb_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, chip);
 
 	/*
-	 * This overrides all of the other current limits and is expected
-	 * to be used for setting limits based on temperature. We set some
-	 * relatively safe default value while still allowing a comfortably
-	 * fast charging rate. Once temperature monitoring is hooked up we
-	 * would expect this to be changed dynamically based on temperature
-	 * reporting.
+	 * Program FCC from DT constant-charge-current-max. Charge-pump mode
+	 * may raise this further to ~2×ICL (capped at 5.1A).
 	 */
-	rc = regmap_write(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
-			  1950000 / CURRENT_SCALE_FACTOR);
+	rc = smb_set_fcc(chip, smb_default_fcc_ua(chip));
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't write fast charge current cfg");
@@ -1101,10 +1424,28 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't write fast AICL rerun time");
 
+	chip->nb.notifier_call = smb_notifier_call;
+	rc = power_supply_reg_notifier(&chip->nb);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to register psy notifier\n");
+
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
 
 	return 0;
+}
+
+static void smb_remove(struct platform_device *pdev)
+{
+	struct smb_chip *chip = platform_get_drvdata(pdev);
+
+	power_supply_unreg_notifier(&chip->nb);
+	if (chip->cp_psy) {
+		power_supply_put(chip->cp_psy);
+		chip->cp_psy = NULL;
+	}
+	smb_cp_hw_enable(chip, false);
 }
 
 static const struct of_device_id smb_match_id_table[] = {
@@ -1118,6 +1459,7 @@ MODULE_DEVICE_TABLE(of, smb_match_id_table);
 
 static struct platform_driver qcom_spmi_smb = {
 	.probe = smb_probe,
+	.remove = smb_remove,
 	.driver = {
 		.name = "qcom-smbx-charger",
 		.of_match_table = smb_match_id_table,
