@@ -1089,6 +1089,10 @@ static const struct smb_init_register smb5_init_seq[] = {
 { .addr = CHARGING_ENABLE_CMD,
   .mask = CHARGING_ENABLE_CMD_BIT,
   .val = CHARGING_ENABLE_CMD_BIT },
+/* Don't wait for Type-C CC detection before starting APSD/HVDCP */
+{ .addr = TYPE_C_CFG,
+  .mask = APSD_START_ON_CC_BIT,
+  .val = 0 },
 /* Enable BC1P2 auto Src detect and HVDCP (QC3.0) handshake */
 { .addr = USBIN_OPTIONS_1_CFG,
   .mask = AUTO_SRC_DETECT_BIT | HVDCP_EN_BIT,
