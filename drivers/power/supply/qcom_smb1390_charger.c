@@ -8,6 +8,8 @@
 
 #include <linux/delay.h>
 #include <linux/i2c.h>
+#include <linux/iio/consumer.h>
+#include <linux/iio/types.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -28,6 +30,10 @@
 #define VPH_OV_HARD_BIT			BIT(1)
 #define TSD_BIT				BIT(2)
 #define IREV_BIT			BIT(3)
+#define IOC_BIT				BIT(4)
+#define VIN_UV_BIT			BIT(5)
+#define VIN_OV_BIT			BIT(6)
+#define EN_PIN_OUT2_BIT			BIT(7)
 
 #define CORE_INT_RT_STS_REG		0x1010
 
@@ -47,7 +53,7 @@
 #define TR_WIN_1P5X_BIT			BIT(0)
 
 #define SMB1390_ILIM_MIN_UA		900000
-#define SMB1390_CP_MIN_VBUS_UV		9000000
+#define SMB1390_CP_MIN_VBUS_UV		8000000
 
 struct smb1390_chip {
 	struct device *dev;
@@ -56,6 +62,7 @@ struct smb1390_chip {
 	struct power_supply *primary_psy;
 	struct mutex lock;
 	struct delayed_work update_work;
+	struct work_struct late_init_work;
 	struct notifier_block nb;
 
 	bool online;
@@ -96,13 +103,16 @@ static int smb1390_init_hw(struct smb1390_chip *chip)
 static int smb1390_set_ilim(struct smb1390_chip *chip, unsigned int ilim_ua)
 {
 	unsigned int code;
+	int rc;
 
 	if (ilim_ua < SMB1390_ILIM_MIN_UA)
 		return -EINVAL;
 
 	code = DIV_ROUND_CLOSEST(ilim_ua - 500000, 100000);
-	return smb1390_masked_write(chip, CORE_FTRIM_ILIM_REG, CFG_ILIM_MASK,
-				    code & CFG_ILIM_MASK);
+	rc = smb1390_masked_write(chip, CORE_FTRIM_ILIM_REG, CFG_ILIM_MASK,
+				  code & CFG_ILIM_MASK);
+	dev_info(chip->dev, "set_ilim=%u code=%u rc=%d\n", ilim_ua, code, rc);
+	return rc;
 }
 
 static int smb1390_set_switcher(struct smb1390_chip *chip, bool enable)
@@ -111,6 +121,7 @@ static int smb1390_set_switcher(struct smb1390_chip *chip, bool enable)
 
 	rc = smb1390_masked_write(chip, CORE_CONTROL1_REG, CMD_EN_SWITCHER_BIT,
 				  enable ? CMD_EN_SWITCHER_BIT : 0);
+	dev_info(chip->dev, "set_switcher=%d rc=%d\n", enable, rc);
 	if (!rc)
 		chip->switcher_on = enable;
 
@@ -122,6 +133,9 @@ static int smb1390_enable(struct smb1390_chip *chip, bool enable)
 	int rc = 0;
 
 	lockdep_assert_held(&chip->lock);
+
+	dev_info(chip->dev, "enable=%d online=%d switcher_on=%d ilim=%u\n",
+		 enable, chip->online, chip->switcher_on, chip->ilim_ua);
 
 	if (enable == chip->online && (!enable || chip->switcher_on))
 		return 0;
@@ -186,6 +200,7 @@ static int smb1390_get_property(struct power_supply *psy,
 		rc = regmap_read(chip->regmap, CORE_STATUS2_REG, &status2);
 		if (rc)
 			return rc;
+		dev_info(chip->dev, "status1=0x%02x status2=0x%02x\n", status1, status2);
 		if ((status1 & (WIN_OV_BIT | WIN_UV_BIT | TEMP_ALARM_BIT)) ||
 		    (status2 & (TSD_BIT | IREV_BIT | VPH_OV_HARD_BIT)))
 			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -210,6 +225,7 @@ static int smb1390_set_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		dev_info(chip->dev, "set CURRENT_MAX=%d\n", val->intval);
 		chip->ilim_ua = val->intval;
 		if (chip->online && chip->ilim_ua >= SMB1390_ILIM_MIN_UA)
 			rc = smb1390_set_ilim(chip, chip->ilim_ua);
@@ -217,6 +233,7 @@ static int smb1390_set_property(struct power_supply *psy,
 			rc = smb1390_enable(chip, false);
 		break;
 	case POWER_SUPPLY_PROP_ONLINE:
+		dev_info(chip->dev, "set ONLINE=%d\n", val->intval);
 		rc = smb1390_enable(chip, !!val->intval);
 		break;
 	default:
@@ -264,7 +281,7 @@ static const struct power_supply_desc smb1390_psy_desc = {
 
 static void smb1390_update_from_primary(struct smb1390_chip *chip)
 {
-	union power_supply_propval online = { 0 }, icl = { 0 };
+	union power_supply_propval online = { 0 }, icl = { 0 }, vbus = { 0 };
 	int rc;
 
 	if (!chip->primary_psy)
@@ -285,19 +302,58 @@ static void smb1390_update_from_primary(struct smb1390_chip *chip)
 		return;
 	}
 
+	/* Read VBUS voltage from primary charger to confirm QC3.0
+	 * has negotiated 9V before enabling the 2:1 charge pump.
+	 */
+	rc = power_supply_get_property(chip->primary_psy,
+				       POWER_SUPPLY_PROP_VOLTAGE_NOW, &vbus);
+	dev_info(chip->dev, "VOLTAGE_NOW rc=%d val=%d\n", rc, vbus.intval);
+	if (rc < 0)
+		vbus.intval = 0;
+
+	/* Try I2C ADC directly if power_supply returns 0 */
+	if (vbus.intval == 0) {
+		struct iio_channel *usbin_v;
+		usbin_v = iio_channel_get(chip->dev, "usbin_v");
+		if (!IS_ERR(usbin_v)) {
+			int iio_rc = iio_read_channel_processed(usbin_v, &vbus.intval);
+			dev_info(chip->dev, "IIO direct rc=%d val=%d\n", iio_rc, vbus.intval);
+			iio_channel_release(usbin_v);
+		} else {
+			dev_info(chip->dev, "IIO channel get failed: %ld\n", PTR_ERR(usbin_v));
+		}
+	}
+
+	/* Need VBUS >= 8V for charge pump 2:1 mode (9V→4.5V/6A=27W).
+	 * If VBUS is 0 (ADC not ready yet), skip — don't enable CP
+	 * until we have a valid high-voltage reading.
+	 */
+	if (vbus.intval <= 0 || vbus.intval < SMB1390_CP_MIN_VBUS_UV) {
+		dev_info(chip->dev, "VBUS=%d uV < %d, CP not enabled\n",
+			vbus.intval, SMB1390_CP_MIN_VBUS_UV);
+		if (chip->online) {
+			mutex_lock(&chip->lock);
+			smb1390_enable(chip, false);
+			mutex_unlock(&chip->lock);
+		}
+		return;
+	}
+
 	rc = power_supply_get_property(chip->primary_psy,
 				       POWER_SUPPLY_PROP_CURRENT_MAX, &icl);
 	if (rc)
-		return;
+		icl.intval = 3000000; /* default 3A for QC3.0 */
 
 	mutex_lock(&chip->lock);
 	/*
-	 * Enable/disable is driven by the primary charger via ONLINE.
-	 * Here we only refresh ILIM when the primary ICL changes.
+	 * Enable only when VBUS >= 8V (QC3.0 negotiated 9V).
+	 * ICL alone is not sufficient — CP needs high voltage.
 	 */
-	if (icl.intval >= SMB1390_ILIM_MIN_UA) {
-		chip->ilim_ua = icl.intval;
-		if (chip->online)
+	if (vbus.intval >= SMB1390_CP_MIN_VBUS_UV && icl.intval >= SMB1390_ILIM_MIN_UA) {
+		chip->ilim_ua = max(icl.intval, (int)SMB1390_ILIM_MIN_UA);
+		if (!chip->online)
+			smb1390_enable(chip, true);
+		else
 			smb1390_set_ilim(chip, chip->ilim_ua);
 	} else if (chip->online) {
 		smb1390_enable(chip, false);
@@ -322,9 +378,15 @@ static int smb1390_notifier_call(struct notifier_block *nb, unsigned long event,
 	if (event != PSY_EVENT_PROP_CHANGED)
 		return NOTIFY_DONE;
 
-	if (chip->primary_psy && psy == chip->primary_psy)
+	if (chip->primary_psy && psy == chip->primary_psy) {
+		/* Cancel any pending update and reschedule with a
+		 * longer delay to debounce rapid property changes
+		 * from the primary charger during QC negotiation.
+		 */
+		cancel_delayed_work_sync(&chip->update_work);
 		schedule_delayed_work(&chip->update_work,
-				      msecs_to_jiffies(50));
+				      msecs_to_jiffies(500));
+	}
 
 	return NOTIFY_OK;
 }
@@ -338,8 +400,10 @@ static irqreturn_t smb1390_stat_irq(int irq, void *data)
 	regmap_read(chip->regmap, CORE_STATUS2_REG, &status2);
 	regmap_read(chip->regmap, CORE_INT_RT_STS_REG, &rt_sts);
 
-	dev_dbg(chip->dev, "SMB_STAT status1=0x%02x status2=0x%02x rt=0x%02x\n",
-		status1, status2, rt_sts);
+	/* Only log meaningful status changes, not spurious zeroes */
+	if (status1 || status2 || rt_sts)
+		dev_info(chip->dev, "STAT irq: status1=0x%02x status2=0x%02x rt=0x%02x\n",
+			status1, status2, rt_sts);
 
 	if ((status2 & (TSD_BIT | IREV_BIT | VPH_OV_HARD_BIT)) ||
 	    (status1 & TEMP_ALARM_BIT)) {
@@ -347,16 +411,45 @@ static irqreturn_t smb1390_stat_irq(int irq, void *data)
 		smb1390_enable(chip, false);
 		mutex_unlock(&chip->lock);
 		dev_err(chip->dev, "fault; switcher disabled\n");
+		/* Only emit changed on fault to avoid udev storm */
+		if (chip->psy)
+			power_supply_changed(chip->psy);
 	}
 
-	power_supply_changed(chip->psy);
 	return IRQ_HANDLED;
+}
+
+static void smb1390_late_init(struct work_struct *work)
+{
+	struct smb1390_chip *chip =
+		container_of(work, struct smb1390_chip, late_init_work);
+	struct power_supply_config cfg = {};
+	int rc;
+
+	cfg.drv_data = chip;
+	cfg.fwnode = dev_fwnode(chip->dev);
+
+	chip->psy = devm_power_supply_register(chip->dev, &smb1390_psy_desc,
+					       &cfg);
+	if (IS_ERR(chip->psy)) {
+		dev_err(chip->dev, "power_supply_register failed: %ld\n",
+			PTR_ERR(chip->psy));
+		chip->psy = NULL;
+		return;
+	}
+
+	chip->nb.notifier_call = smb1390_notifier_call;
+	rc = power_supply_reg_notifier(&chip->nb);
+	if (rc)
+		dev_warn(chip->dev, "notifier reg failed: %d\n", rc);
+
+	schedule_delayed_work(&chip->update_work, msecs_to_jiffies(1000));
+	dev_info(chip->dev, "SMB1390 late init done\n");
 }
 
 static int smb1390_probe(struct i2c_client *client)
 {
 	struct smb1390_chip *chip;
-	struct power_supply_config cfg = {};
 	unsigned int status;
 	int rc;
 
@@ -382,20 +475,8 @@ static int smb1390_probe(struct i2c_client *client)
 	if (rc)
 		return dev_err_probe(chip->dev, rc, "trim init failed\n");
 
-	cfg.drv_data = chip;
-	cfg.fwnode = dev_fwnode(chip->dev);
-
-	chip->psy = devm_power_supply_register(chip->dev, &smb1390_psy_desc,
-					       &cfg);
-	if (IS_ERR(chip->psy))
-		return PTR_ERR(chip->psy);
-
 	INIT_DELAYED_WORK(&chip->update_work, smb1390_update_work);
-
-	chip->nb.notifier_call = smb1390_notifier_call;
-	rc = power_supply_reg_notifier(&chip->nb);
-	if (rc)
-		return rc;
+	INIT_WORK(&chip->late_init_work, smb1390_late_init);
 
 	chip->irq = client->irq;
 	if (chip->irq > 0) {
@@ -406,7 +487,11 @@ static int smb1390_probe(struct i2c_client *client)
 			dev_warn(chip->dev, "IRQ request failed: %d\n", rc);
 	}
 
-	schedule_delayed_work(&chip->update_work, msecs_to_jiffies(500));
+	/* Delay power_supply registration and notifier to avoid
+	 * udev event storm during boot. The charge pump hardware
+	 * is initialized; userspace and notifier will come later.
+	 */
+	schedule_work(&chip->late_init_work);
 
 	dev_info(chip->dev, "SMB1390 charge pump probed (status1=0x%02x)\n",
 		 status);
@@ -417,6 +502,7 @@ static void smb1390_remove(struct i2c_client *client)
 {
 	struct smb1390_chip *chip = i2c_get_clientdata(client);
 
+	cancel_work_sync(&chip->late_init_work);
 	power_supply_unreg_notifier(&chip->nb);
 	cancel_delayed_work_sync(&chip->update_work);
 	mutex_lock(&chip->lock);

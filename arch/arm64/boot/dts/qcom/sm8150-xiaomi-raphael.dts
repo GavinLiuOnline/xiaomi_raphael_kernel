@@ -624,7 +624,7 @@
 		compatible = "qcom,smb1390-charger";
 		reg = <0x10>;
 		interrupt-parent = <&pm8150b_gpios>;
-		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+		interrupts = <6 IRQ_TYPE_EDGE_FALLING>;
 		qcom,primary-charger = <&pm8150b_charger>;
 		status = "okay";
 	};
@@ -702,9 +702,12 @@
 };
 
 &pm8150b_typec {
-	vdd-vbus-supply = <&pm8150b_vbus>;
-	vdd-pdphy-supply = <&vdda_usb_hs_3p1>;
-	status = "okay";
+	/* Disabled: USB-A-to-C cable has no CC signal, Type-C controller
+	 * interferes with D+/D- QC3.0 negotiation by trying PD and
+	 * grabbing D+/D- control away from the charger IC.
+	 * Charge path works via PM8150B charger with uUSB factory mode.
+	 */
+	status = "disabled";
 
 	connector {
 		compatible = "usb-c-connector";
@@ -749,10 +752,14 @@
 	power-supplies = <&pm8150b_charger>, <&smb1390>;
 };
 
+&usb_1_hsphy {
+	status = "okay";
+};
+
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
-	qcom,charge-pump = <&smb1390>;
+	dpdm-supply = <&dpdm_reg>;
 };
 
 &pm8150b_vbus {
@@ -1372,6 +1379,9 @@
 	vdda33-supply = <&vdda_usb_hs_3p1>;
 	vdda18-supply = <&vdda_usb_hs_1p8>;
 	status = "okay";
+
+	dpdm_reg: qcom,dpdm-regulator {
+	};
 };
 
 &wifi {
