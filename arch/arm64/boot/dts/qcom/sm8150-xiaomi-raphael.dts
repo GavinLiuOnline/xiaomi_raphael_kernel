@@ -1338,6 +1338,9 @@
 		vddxo-supply = <&vreg_pmu_xo>;
 		vddrf-supply = <&vreg_pmu_rf>;
 		vddch0-supply = <&vreg_pmu_ch0>;
+
+		max-speed = <3200000>;
+		local-bd-address = [ 00 07 64 21 90 39 ];
 	};
 };
 
