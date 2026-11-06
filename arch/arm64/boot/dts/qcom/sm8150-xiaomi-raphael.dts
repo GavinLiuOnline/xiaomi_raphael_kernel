@@ -733,6 +733,13 @@
 
 		op-sink-microwatt = <15000000>;
 
+		altmodes {
+			displayport {
+				svid = /bits/ 16 <0xff01>;
+				vdo = <0x00001c46>;
+			};
+		};
+
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -741,6 +748,14 @@
 				reg = <0>;
 				pm8150b_hs_in: endpoint {
 					remote-endpoint = <&usb_1_dwc3_hs>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				pm8150b_typec_ss_in: endpoint {
+					remote-endpoint = <&usb_1_qmpphy_out>;
 				};
 			};
 		};
@@ -1379,6 +1394,30 @@
 
 &usb_1_dwc3_hs {
 	remote-endpoint = <&pm8150b_hs_in>;
+};
+
+/*
+ * USB3/DP combo PHY.  The USB3 SuperSpeed lanes are not used for USB on
+ * this board, but the very same differential pairs carry the DisplayPort
+ * main link, so the PHY must be probed for DP alt mode on the Type-C port.
+ */
+&usb_1_qmpphy {
+	status = "okay";
+	vdda-phy-supply = <&vreg_l3c_1p2>;
+	vdda-pll-supply = <&vreg_l5a_0p875>;
+	orientation-switch;
+};
+
+&usb_1_qmpphy_out {
+	remote-endpoint = <&pm8150b_typec_ss_in>;
+};
+
+&mdss_dp {
+	status = "okay";
+};
+
+&mdss_dp_out {
+	data-lanes = <0 1>;
 };
 
 &usb_1_hsphy {
