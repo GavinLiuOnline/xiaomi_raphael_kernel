@@ -258,6 +258,28 @@
 		startup-delay-us = <5000>;
 	};
 
+	/* 1.8 V I/O rail shared by all camera sensors (enable: GPIO 97). */
+	camera_viodd_ldo: regulator-camera-vio {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_viodd_ldo";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&tlmm 97 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vreg_s4a_1p8>;
+	};
+
+	/* 1.352 V digital rail for the wide camera (enable: GPIO 90). */
+	camera_vdig_ldo: regulator-camera-vdig {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_vdig_ldo";
+		regulator-min-microvolt = <1352000>;
+		regulator-max-microvolt = <1352000>;
+		gpio = <&tlmm 90 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vreg_s8c_1p3>;
+	};
+
 	wcn3998-pmu {
 		compatible = "qcom,wcn3998-pmu";
 
@@ -1500,4 +1522,46 @@
 
 &cci1 {
 	status = "okay";
+};
+
+&cci0_i2c0 {
+	status = "okay";
+
+	/* Wide camera: Sony IMX586, 4-lane CSI-2 on CSIPHY0. */
+	imx586: camera@1a {
+		compatible = "sony,imx586";
+		reg = <0x1a>;
+
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		clock-names = "xclk";
+
+		reset-gpios = <&tlmm 28 GPIO_ACTIVE_LOW>;
+
+		avdd-supply = <&vreg_bob>;
+		dovdd-supply = <&camera_viodd_ldo>;
+		dvdd-supply = <&camera_vdig_ldo>;
+
+		port {
+			imx586_ep: endpoint {
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <400000000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
+};
+
+&camss {
+	ports {
+		port@0 {
+			reg = <0>;
+
+			csiphy0_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1 2 3>;
+				link-frequencies = /bits/ 64 <400000000>;
+				remote-endpoint = <&imx586_ep>;
+			};
+		};
+	};
 };
