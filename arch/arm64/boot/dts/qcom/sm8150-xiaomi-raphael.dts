@@ -680,6 +680,7 @@
 
 &mdss {
 	status = "okay";
+	qcom,boot-display-on;
 };
 
 &pm8150_gpios {
@@ -1416,6 +1417,7 @@
  * adequately powered until handoff.
  */
 &dispcc {
+	qcom,boot-display-on;
 	required-opps = <&rpmhpd_opp_nom>;
 	interconnects = <&mmss_noc MASTER_MDP_PORT0 0 &mc_virt SLAVE_EBI_CH0 0>,
 			<&mmss_noc MASTER_MDP_PORT1 0 &mc_virt SLAVE_EBI_CH0 0>;
