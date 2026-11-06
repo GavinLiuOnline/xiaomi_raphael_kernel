@@ -58,6 +58,12 @@ static int core_clks_enable(struct venus_core *core)
 		dev_pm_opp_put(opp);
 	}
 
+	if (IS_IRIS1(core)) {
+		ret = dev_pm_opp_set_rate(dev, freq);
+		if (ret)
+			return ret;
+	}
+
 	for (i = 0; i < res->clks_num; i++) {
 		if (IS_V6(core) || (IS_V4(core) && is_lite(core))) {
 			ret = clk_set_rate(core->clks[i], freq);
@@ -68,6 +74,11 @@ static int core_clks_enable(struct venus_core *core)
 		ret = clk_prepare_enable(core->clks[i]);
 		if (ret)
 			goto err;
+	}
+
+	if (IS_IRIS1(core)) {
+		writel(0, core->wrapper_base + WRAPPER_CPU_CGC_DIS);
+		writel(0, core->wrapper_base + WRAPPER_CPU_CLOCK_CONFIG);
 	}
 
 	return 0;
@@ -89,12 +100,23 @@ static void core_clks_disable(struct venus_core *core)
 
 static int core_clks_set_rate(struct venus_core *core, unsigned long freq)
 {
-	int ret;
+	const struct venus_resources *res = core->res;
+	int ret, i;
 
 	ret = dev_pm_opp_set_rate(core->dev, freq);
 	if (ret)
 		return ret;
 
+	if (!res->vcodec_clks_num)
+		goto set_rates;
+
+	for (i = 0; i < res->vcodec_clks_num; i++) {
+		ret = clk_set_rate(core->vcodec_clks[i], freq);
+		if (ret)
+			return ret;
+	}
+
+set_rates:
 	ret = clk_set_rate(core->vcodec0_clks[0], freq);
 	if (ret)
 		return ret;
@@ -297,9 +319,32 @@ exit:
 	return ret;
 }
 
+static int vcodec_domains_get_v1(struct venus_core *core)
+{
+	struct device *dev = core->dev;
+	const struct venus_resources *res = core->res;
+	const struct dev_pm_domain_attach_data vcodec_data = {
+		.pd_names = res->vcodec_pmdomains,
+		.num_pd_names = res->vcodec_pmdomains_num,
+		.pd_flags = PD_FLAG_NO_DEV_LINK,
+	};
+
+	if (!res->vcodec_pmdomains)
+		return 0;
+
+	return devm_pm_domain_attach_list(dev, &vcodec_data,
+					  &core->pmdomains);
+}
+
 static int core_get_v1(struct venus_core *core)
 {
+	const struct venus_resources *res = core->res;
+	struct device *dev = core->dev;
 	int ret;
+
+	ret = vcodec_domains_get_v1(core);
+	if (ret < 0)
+		return ret;
 
 	ret = core_clks_get(core);
 	if (ret)
@@ -309,7 +354,77 @@ static int core_get_v1(struct venus_core *core)
 	if (ret)
 		return ret;
 
+	if (!res->vcodec_pmdomains)
+		return 0;
+
+	ret = vcodec_clks_get(core, dev, core->vcodec_clks,
+			      res->vcodec_clks);
+	if (ret)
+		return ret;
+
 	return 0;
+}
+
+static int vcodec_domains_enable(struct venus_core *core)
+{
+	const struct venus_resources *res = core->res;
+	struct device *pd_dev;
+	int i = 0, ret;
+
+	if (!res->vcodec_pmdomains)
+		return 0;
+
+	for (; i < res->vcodec_pmdomains_num; i++) {
+		pd_dev = core->pmdomains->pd_devs[i];
+		ret = pm_runtime_resume_and_get(pd_dev);
+		if (ret)
+			goto err;
+	}
+
+	return 0;
+err:
+	while (i--) {
+		pd_dev = core->pmdomains->pd_devs[i];
+		pm_runtime_put_sync(pd_dev);
+	}
+	return ret;
+}
+
+static void vcodec_domains_disable(struct venus_core *core)
+{
+	const struct venus_resources *res = core->res;
+	struct device *pd_dev;
+	int i = res->vcodec_pmdomains_num;
+
+	if (!res->vcodec_pmdomains)
+		return;
+
+	while (i--) {
+		pd_dev = core->pmdomains->pd_devs[i];
+		pm_runtime_put_sync(pd_dev);
+	}
+}
+
+static int vcodec_domains_set_hw(struct venus_core *core, bool is_hw)
+{
+	const struct venus_resources *res = core->res;
+	struct device *pd_dev;
+	int i = 0, ret;
+
+	for (; i < res->vcodec_pmdomains_num; i++) {
+		pd_dev = core->pmdomains->pd_devs[i];
+		ret = dev_pm_genpd_set_hwmode(pd_dev, is_hw);
+		if (ret && ret != -EOPNOTSUPP)
+			goto err;
+	}
+
+	return 0;
+err:
+	while (i--) {
+		pd_dev = core->pmdomains->pd_devs[i];
+		dev_pm_genpd_set_hwmode(pd_dev, !is_hw);
+	}
+	return ret;
 }
 
 static void core_put_v1(struct venus_core *core)
@@ -320,11 +435,43 @@ static int core_power_v1(struct venus_core *core, int on)
 {
 	int ret = 0;
 
-	if (on == POWER_ON)
-		ret = core_clks_enable(core);
-	else
-		core_clks_disable(core);
+	if (on == POWER_ON) {
+		ret = vcodec_domains_enable(core);
+		if (ret)
+			return ret;
 
+		ret = core_clks_enable(core);
+		if (ret)
+			goto fail_pmdomains;
+
+		if (!core->res->vcodec_pmdomains)
+			return 0;
+
+		ret = vcodec_clks_enable(core, core->vcodec_clks);
+		if (ret)
+			goto fail_core_clks;
+
+		ret = vcodec_domains_set_hw(core, true);
+		if (ret)
+			goto fail_vcodec_clks;
+
+	} else {
+		if (core->res->vcodec_pmdomains) {
+			vcodec_domains_set_hw(core, false);
+			vcodec_clks_disable(core, core->vcodec_clks);
+		}
+		core_clks_disable(core);
+		vcodec_domains_disable(core);
+	}
+
+	return 0;
+
+fail_vcodec_clks:
+	vcodec_clks_disable(core, core->vcodec_clks);
+fail_core_clks:
+	core_clks_disable(core);
+fail_pmdomains:
+	vcodec_domains_disable(core);
 	return ret;
 }
 
@@ -645,7 +792,6 @@ static int decide_core(struct venus_inst *inst)
 	unsigned long max_freq = ULONG_MAX;
 	struct device *dev = core->dev;
 	struct dev_pm_opp *opp;
-	int ret = 0;
 
 	if (legacy_binding) {
 		if (inst->session_type == VIDC_SESSION_TYPE_DEC)
@@ -693,11 +839,7 @@ static int decide_core(struct venus_inst *inst)
 	}
 
 done:
-	ret = hfi_session_set_property(inst, ptype, &cu);
-	if (ret)
-		return ret;
-
-	return ret;
+	return hfi_session_set_property(inst, ptype, &cu);
 }
 
 static int acquire_core(struct venus_inst *inst)
@@ -764,6 +906,19 @@ static int coreid_power_v4(struct venus_inst *inst, int on)
 {
 	struct venus_core *core = inst->core;
 	int ret;
+
+	if (IS_IRIS1(core)) {
+		/* Codec/CVP islands belong to the parent firmware power cycle. */
+		if (on == POWER_ON) {
+			ret = decide_core(inst);
+			if (!ret)
+				inst->core_acquired = true;
+			return ret;
+		}
+		inst->clk_data.core_id = VIDC_CORE_ID_DEFAULT;
+		inst->core_acquired = false;
+		return 0;
+	}
 
 	if (legacy_binding)
 		return 0;
@@ -875,7 +1030,7 @@ static int venc_power_v4(struct device *dev, int on)
 	return ret;
 }
 
-static int vcodec_domains_get(struct venus_core *core)
+static int vcodec_domains_get_v4(struct venus_core *core)
 {
 	int ret;
 	struct device *dev = core->dev;
@@ -887,7 +1042,7 @@ static int vcodec_domains_get(struct venus_core *core)
 	};
 	struct dev_pm_domain_attach_data opp_pd_data = {
 		.pd_names = res->opp_pmdomain,
-		.num_pd_names = 1,
+		.num_pd_names = res->opp_pmdomain_num,
 		.pd_flags = PD_FLAG_DEV_LINK_ON | PD_FLAG_REQUIRED_OPP,
 	};
 
@@ -993,7 +1148,7 @@ static int core_get_v4(struct venus_core *core)
 	if (ret)
 		return ret;
 
-	ret = vcodec_domains_get(core);
+	ret = vcodec_domains_get_v4(core);
 	if (ret)
 		return ret;
 
@@ -1020,12 +1175,92 @@ static void core_put_v4(struct venus_core *core)
 {
 }
 
+static int iris1_reset_bridge(struct venus_core *core)
+{
+	unsigned int i, asserted = 0;
+	int ret = 0, err;
+
+	for (i = 0; i < core->res->resets_num; i++) {
+		ret = reset_control_assert(core->resets[i]);
+		if (ret)
+			break;
+		asserted++;
+	}
+
+	if (asserted)
+		usleep_range(150, 250);
+
+	/* Release every asserted reset, including when assertion failed. */
+	for (i = 0; i < asserted; i++) {
+		err = reset_control_deassert(core->resets[i]);
+		if (!ret)
+			ret = err;
+	}
+
+	return ret;
+}
+
+static int core_power_iris1(struct venus_core *core, int on)
+{
+	struct device *dev = core->dev;
+	unsigned int i, acquired = 0;
+	int ret = 0, err;
+
+	if (!core->pmdomains || core->res->vcodec_pmdomains_num != 3)
+		return -EINVAL;
+
+	if (on != POWER_ON) {
+		core_clks_disable(core);
+		ret = dev_pm_opp_set_rate(dev, 0);
+		for (i = core->res->vcodec_pmdomains_num; i > 0; i--) {
+			err = pm_runtime_put_sync(core->pmdomains->pd_devs[i - 1]);
+			if (!ret && err < 0)
+				ret = err;
+		}
+		return ret;
+	}
+
+	for (i = 0; i < core->res->vcodec_pmdomains_num; i++) {
+		ret = pm_runtime_resume_and_get(core->pmdomains->pd_devs[i]);
+		if (ret < 0)
+			goto unwind;
+		acquired++;
+
+		/*
+		 * Keep video/CVP on throughout the firmware cycle. Inter-frame
+		 * hardware power collapse is a later optimization.
+		 */
+		if (i) {
+			ret = dev_pm_genpd_set_hwmode(core->pmdomains->pd_devs[i], false);
+			if (ret)
+				goto unwind;
+		}
+	}
+
+	ret = iris1_reset_bridge(core);
+	if (ret)
+		goto unwind;
+
+	ret = core_clks_enable(core);
+	if (!ret)
+		return 0;
+
+unwind:
+	dev_pm_opp_set_rate(dev, 0);
+	while (acquired)
+		pm_runtime_put_sync(core->pmdomains->pd_devs[--acquired]);
+	return ret;
+}
+
 static int core_power_v4(struct venus_core *core, int on)
 {
 	struct device *dev = core->dev;
 	struct device *pmctrl = core->pmdomains ?
 			core->pmdomains->pd_devs[0] : NULL;
 	int ret = 0;
+
+	if (IS_IRIS1(core))
+		return core_power_iris1(core, on);
 
 	if (on == POWER_ON) {
 		if (pmctrl) {

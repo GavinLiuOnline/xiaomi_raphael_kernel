@@ -5,6 +5,7 @@
  */
 #include <linux/init.h>
 #include <linux/interconnect.h>
+#include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/ioctl.h>
 #include <linux/delay.h>
@@ -18,6 +19,7 @@
 #include <linux/types.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/videodev2.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-mem2mem.h>
@@ -178,6 +180,8 @@ static void venus_sys_error_handler(struct work_struct *work)
 static u32 to_v4l2_codec_type(u32 codec)
 {
 	switch (codec) {
+	case HFI_VIDEO_CODEC_HEVC:
+		return V4L2_PIX_FMT_HEVC;
 	case HFI_VIDEO_CODEC_H264:
 		return V4L2_PIX_FMT_H264;
 	case HFI_VIDEO_CODEC_H263:
@@ -303,7 +307,7 @@ static int venus_add_video_core(struct venus_core *core, const char *node_name,
 	if (!node_name)
 		return 0;
 
-	enp = of_find_node_by_name(dev->of_node, node_name);
+	enp = of_get_child_by_name(dev->of_node, node_name);
 	if (enp) {
 		of_node_put(enp);
 		return 0;
@@ -373,6 +377,57 @@ static int venus_add_dynamic_nodes(struct venus_core *core)
 
 static void venus_remove_dynamic_nodes(struct venus_core *core) {}
 #endif
+
+static int venus_get_secure_nonpixel_device(struct venus_core *core)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	int ret;
+
+	if (!IS_IRIS1(core))
+		return 0;
+
+	np = of_get_compatible_child(core->dev->of_node,
+				     "qcom,venus-secure-context");
+	if (!np) {
+		dev_warn(core->dev,
+			 "secure non-pixel context absent; IRIS1 encoder disabled\n");
+		return 0;
+	}
+
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+
+	if (!iommu_get_domain_for_dev(&pdev->dev)) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	ret = dma_set_coherent_mask(&pdev->dev,
+				    (dma_addr_t)core->res->cp_nonpixel_start +
+				    core->res->cp_nonpixel_size - 1);
+	if (ret) {
+		dev_err(core->dev,
+			"failed to constrain secure non-pixel DMA mask: %d\n",
+			ret);
+		put_device(&pdev->dev);
+		return ret;
+	}
+
+	core->secure_nonpixel_dev = &pdev->dev;
+	return 0;
+}
+
+static void venus_put_secure_nonpixel_device(struct venus_core *core)
+{
+	if (!core->secure_nonpixel_dev)
+		return;
+
+	put_device(core->secure_nonpixel_dev);
+	core->secure_nonpixel_dev = NULL;
+}
 
 static int venus_probe(struct platform_device *pdev)
 {
@@ -487,6 +542,10 @@ static int venus_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_remove_dynamic_nodes;
 
+	ret = venus_get_secure_nonpixel_device(core);
+	if (ret)
+		goto err_of_depopulate;
+
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_DEC);
 	if (ret)
 		goto err_of_depopulate;
@@ -506,6 +565,7 @@ static int venus_probe(struct platform_device *pdev)
 	return 0;
 
 err_of_depopulate:
+	venus_put_secure_nonpixel_device(core);
 	of_platform_depopulate(dev);
 err_remove_dynamic_nodes:
 	venus_remove_dynamic_nodes(core);
@@ -543,6 +603,7 @@ static void venus_remove(struct platform_device *pdev)
 	WARN_ON(ret);
 
 	venus_shutdown(core);
+	venus_put_secure_nonpixel_device(core);
 	of_platform_depopulate(dev);
 
 	venus_firmware_deinit(core);
@@ -684,6 +745,47 @@ static const struct venus_resources msm8916_res = {
 	.vmem_addr = 0,
 	.dma_mask = 0xddc00000 - 1,
 	.fwname = "qcom/venus-1.8/venus.mbn",
+	.dec_codec_blacklist = HFI_VIDEO_CODEC_HEVC | HFI_VIDEO_CODEC_SPARK,
+	.enc_codec_blacklist = HFI_VIDEO_CODEC_HEVC,
+	.dec_nodename = "video-decoder",
+	.enc_nodename = "video-encoder",
+};
+
+static const struct freq_tbl msm8939_freq_table[] = {
+	{ 489600, 266670000 },	/* 1080p @ 60 */
+	{ 244800, 133330000 },	/* 1080p @ 30 */
+	{ 220800, 133330000 },	/* 720p @ 60 */
+	{ 108000, 133330000 },	/* 720p @ 30 */
+	{ 72000, 133330000 },	/* VGA @ 60 */
+	{ 36000, 133330000 },	/* VGA @ 30 */
+};
+
+static const struct reg_val msm8939_reg_preset[] = {
+	{ 0xe0020, 0x0aaaaaaa },
+	{ 0xe0024, 0x0aaaaaaa },
+	{ 0x80124, 0x00000003 },
+};
+
+static const struct venus_resources msm8939_res = {
+	.freq_tbl = msm8939_freq_table,
+	.freq_tbl_size = ARRAY_SIZE(msm8939_freq_table),
+	.reg_tbl = msm8939_reg_preset,
+	.reg_tbl_size = ARRAY_SIZE(msm8939_reg_preset),
+	.clks = { "core", "iface", "bus", },
+	.clks_num = 3,
+	.vcodec_clks = { "vcodec0_core", "vcodec1_core" },
+	.vcodec_clks_num = 2,
+	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0", "vcodec1" },
+	.vcodec_pmdomains_num = 3,
+	.max_load = 489600, /* 1080p@30 + 1080p@30 */
+	.hfi_version = HFI_VERSION_1XX,
+	.vmem_id = VIDC_RESOURCE_NONE,
+	.vmem_size = 0,
+	.vmem_addr = 0,
+	.dma_mask = 0xddc00000 - 1,
+	.fwname = "qcom/venus-1.8/venus.mbn",
+	.dec_codec_blacklist = HFI_VIDEO_CODEC_SPARK,
+	.enc_codec_blacklist = HFI_VIDEO_CODEC_HEVC,
 	.dec_nodename = "video-decoder",
 	.enc_nodename = "video-encoder",
 };
@@ -882,6 +984,7 @@ static const struct venus_resources sdm845_res_v2 = {
 	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0", "vcodec1" },
 	.vcodec_pmdomains_num = 3,
 	.opp_pmdomain = (const char *[]) { "cx" },
+	.opp_pmdomain_num = 1,
 	.vcodec_num = 2,
 	.max_load = 3110400,	/* 4096x2160@90 */
 	.hfi_version = HFI_VERSION_4XX,
@@ -933,6 +1036,7 @@ static const struct venus_resources sc7180_res = {
 	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0" },
 	.vcodec_pmdomains_num = 2,
 	.opp_pmdomain = (const char *[]) { "cx" },
+	.opp_pmdomain_num = 1,
 	.vcodec_num = 1,
 	.hfi_version = HFI_VERSION_4XX,
 	.vpu_version = VPU_VERSION_AR50,
@@ -991,7 +1095,8 @@ static const struct venus_resources sm8250_res = {
 	.vcodec_clks_num = 1,
 	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0" },
 	.vcodec_pmdomains_num = 2,
-	.opp_pmdomain = (const char *[]) { "mx" },
+	.opp_pmdomain = (const char *[]) { "mx", "mmcx" },
+	.opp_pmdomain_num = 2,
 	.vcodec_num = 1,
 	.max_load = 7833600,
 	.hfi_version = HFI_VERSION_6XX,
@@ -1053,6 +1158,7 @@ static const struct venus_resources sc7280_res = {
 	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0" },
 	.vcodec_pmdomains_num = 2,
 	.opp_pmdomain = (const char *[]) { "cx" },
+	.opp_pmdomain_num = 1,
 	.vcodec_num = 1,
 	.hfi_version = HFI_VERSION_6XX,
 	.vpu_version = VPU_VERSION_IRIS2_1,
@@ -1100,6 +1206,7 @@ static const struct venus_resources qcm2290_res = {
 	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0" },
 	.vcodec_pmdomains_num = 2,
 	.opp_pmdomain = (const char *[]) { "cx" },
+	.opp_pmdomain_num = 1,
 	.vcodec_num = 1,
 	.hfi_version = HFI_VERSION_4XX,
 	.vpu_version = VPU_VERSION_AR50_LITE,
@@ -1119,16 +1226,53 @@ static const struct venus_resources qcm2290_res = {
 	.min_fw = &min_fw,
 };
 
+/* Conservative no-system-cache vote from the downstream bus ceiling. */
+static const struct bw_tbl sm8150_bw_table[] = {
+	{ 0, 6533000, 0, 6533000, 0 },
+};
+
+static const struct venus_resources sm8150_res = {
+	.bw_tbl_enc = sm8150_bw_table,
+	.bw_tbl_enc_size = ARRAY_SIZE(sm8150_bw_table),
+	.bw_tbl_dec = sm8150_bw_table,
+	.bw_tbl_dec_size = ARRAY_SIZE(sm8150_bw_table),
+	.clks = { "iface", "vcodec0_bus", "cvp_bus", "core",
+		  "vcodec0_core", "cvp_core", "bus" },
+	.clks_num = 7,
+	.resets = { "bus", "core", "vcodec0", "cvp" },
+	.resets_num = 4,
+	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0", "cvp" },
+	.vcodec_pmdomains_num = 3,
+	.opp_pmdomain = (const char *[]) { "mmcx" },
+	.vcodec_num = 1,
+	.max_load = 3916800,
+	.hfi_version = HFI_VERSION_4XX,
+	.vpu_version = VPU_VERSION_IRIS1,
+	.num_vpp_pipes = 2,
+	.vmem_id = VIDC_RESOURCE_NONE,
+	.dma_mask = 0xe0000000 - 1,
+	.cp_start = 0,
+	.cp_size = 0x25800000,
+	.cp_nonpixel_start = 0x1000000,
+	.cp_nonpixel_size = 0x24800000,
+	.fwname = "qcom/sm8150/venus.mbn",
+	.dec_nodename = "video-decoder",
+	.enc_nodename = "video-encoder",
+};
+
+
 static const struct of_device_id venus_dt_match[] = {
 	{ .compatible = "qcom,msm8916-venus", .data = &msm8916_res, },
+	{ .compatible = "qcom,msm8939-venus", .data = &msm8939_res, },
 	{ .compatible = "qcom,msm8996-venus", .data = &msm8996_res, },
 	{ .compatible = "qcom,msm8998-venus", .data = &msm8998_res, },
 	{ .compatible = "qcom,qcm2290-venus", .data = &qcm2290_res, },
 	{ .compatible = "qcom,sc7180-venus", .data = &sc7180_res, },
-	{ .compatible = "qcom,sc7280-venus", .data = &sc7280_res, },
 	{ .compatible = "qcom,sdm660-venus", .data = &sdm660_res, },
 	{ .compatible = "qcom,sdm845-venus", .data = &sdm845_res, },
 	{ .compatible = "qcom,sdm845-venus-v2", .data = &sdm845_res_v2, },
+	{ .compatible = "qcom,sc7280-venus", .data = &sc7280_res, },
+	{ .compatible = "qcom,sm8150-venus", .data = &sm8150_res, },
 	{ .compatible = "qcom,sm8250-venus", .data = &sm8250_res, },
 	{ }
 };
