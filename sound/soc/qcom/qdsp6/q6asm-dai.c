@@ -225,7 +225,15 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
 	/* rate and channels are sent to audio driver */
-	if (prtd->state == Q6ASM_STREAM_RUNNING) {
+	/*
+	 * A session that has been prepared before must be closed here even if
+	 * it is no longer RUNNING (e.g. it was stopped by SNDRV_PCM_TRIGGER_STOP
+	 * or by a previous close).  The DSP keeps the stream open until it gets
+	 * ASM_STREAM_CMD_CLOSE, so re-opening it without closing first fails
+	 * with ADSP_EALREADY ("DSP returned error[9]").  That made the second
+	 * and every later playback/capture start fail until reboot.
+	 */
+	if (prtd->state != Q6ASM_STREAM_IDLE) {
 		/* clear the previous setup if any  */
 		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		q6asm_unmap_memory_regions(substream->stream,
