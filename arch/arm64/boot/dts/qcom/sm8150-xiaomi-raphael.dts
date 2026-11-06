@@ -705,12 +705,9 @@
 };
 
 &pm8150b_typec {
-	/* Disabled: USB-A-to-C cable has no CC signal, Type-C controller
-	 * interferes with D+/D- QC3.0 negotiation by trying PD and
-	 * grabbing D+/D- control away from the charger IC.
-	 * Charge path works via PM8150B charger with uUSB factory mode.
-	 */
-	status = "disabled";
+	vdd-vbus-supply = <&pm8150b_vbus>;
+	vdd-pdphy-supply = <&vdda_usb_hs_3p1>;
+	status = "okay";
 
 	connector {
 		compatible = "usb-c-connector";
