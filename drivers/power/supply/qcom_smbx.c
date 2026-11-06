@@ -1505,16 +1505,16 @@ static const struct smb_init_register smb5_init_seq[] = {
 { .addr = TYPE_C_CFG,
   .mask = APSD_START_ON_CC_BIT | FACTORY_MODE_DETECTION_EN_BIT,
   .val = FACTORY_MODE_DETECTION_EN_BIT },
-/* Force uUSB factory mode so D+/D- get routed to charger for APSD/QC */
-{ .addr = TYPEC_U_USB_CFG_REG,
-  .mask = EN_MICRO_USB_FACTORY_MODE_BIT | EN_MICRO_USB_MODE_BIT,
-  .val = EN_MICRO_USB_FACTORY_MODE_BIT | EN_MICRO_USB_MODE_BIT },
-/* Disable Type-C DRP state machine — it interferes with D+/D- QC
- * negotiation when no CC signal is present (USB-A-to-C cable).
- * Set EN_SNK_ONLY_BIT to prevent Type-C from trying source role. */
-{ .addr = 0x544,	/* TYPE_C_MODE_CFG_REG */
-  .mask = 0x1f,	/* EN_TRY_SNK|EN_SRC_ONLY|EN_SNK_ONLY etc */
-  .val = BIT(1) },	/* EN_SNK_ONLY_BIT - sink only, no DRP */
+/*
+ * Do NOT force the Type-C block into uUSB factory mode or sink-only mode
+ * here.  The Type-C port is owned by the qcom,pmic-typec TCPM driver, which
+ * keeps the CC state machine in DRP (EN_TRY_SNK) so that cables, chargers and
+ * USB-C docks are detected automatically.  Forcing EN_MICRO_USB_MODE (or
+ * EN_SNK_ONLY) overrides the CC state machine: the port then only ever works
+ * as a sink (charging / USB gadget) and never as a host for a dock.
+ * APSD (D+/D- charger detection) still runs in Attached.SNK, so charger type
+ * detection is unaffected.
+ */
 /* Enable HVDCP auth + QC enable (no autonomous mode - vendor driver
  * uses software SINGLE_INCREMENT for QC3.0 voltage control) */
 { .addr = USBIN_OPTIONS_1_CFG,
