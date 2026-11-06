@@ -785,6 +785,11 @@ static void smb_apply_input_limits(struct smb_chip *chip)
 		chip->apsd_rerun_done = false;
 		chip->apsd_retry_count = 0;
 		chip->qc3_wait_count = 0;
+		/* Return D+/D- to the PHY on disconnect */
+		if (chip->dpdm_reg && chip->dpdm_enabled) {
+			regulator_disable(chip->dpdm_reg);
+			chip->dpdm_enabled = false;
+		}
 		mutex_unlock(&chip->lock);
 		return;
 	}
@@ -928,6 +933,17 @@ static void smb_apply_input_limits(struct smb_chip *chip)
 		pr_info("smb: APSD rc=%d charger_type=%d hvdcp=%d retry=%d\n",
 			rc, charger_type, chip->hvdcp_detected,
 			chip->apsd_retry_count);
+
+		/* A data cable (SDP/CDP) needs D+/D- back in the PHY,
+		 * otherwise the host can never enumerate the USB gadget.
+		 * Only keep the PMIC in control for HVDCP/QC chargers.
+		 */
+		if (!chip->hvdcp_detected && chip->dpdm_reg && chip->dpdm_enabled) {
+			regulator_disable(chip->dpdm_reg);
+			chip->dpdm_enabled = false;
+			pr_info("smb: DPDM released back to PHY (charger_type=%d)\n",
+				charger_type);
+		}
 
 		if (chip->hvdcp_detected) {
 			/* QC charger detected. If this is the first time
@@ -1774,19 +1790,11 @@ static int smb_probe(struct platform_device *pdev)
 		dev_info(chip->dev, "Found dpdm regulator via DTS\n");
 	}
 
-	/* Enable dpdm regulator immediately at probe so that:
-	 * 1) PHY releases D+/D- lines to PMIC for APSD/QC
-	 * 2) regulator_init_complete doesn't auto-disable it
+	/* Keep D+/D- routed to the PHY at probe time so that a data cable
+	 * (SDP/CDP) can be enumerated by the host. The regulator is enabled
+	 * on demand in smb_apply_input_limits() for PMIC APSD/QC and is
+	 * released back to the PHY once a non-HVDCP charger is detected.
 	 */
-	if (chip->dpdm_reg) {
-		rc = regulator_enable(chip->dpdm_reg);
-		if (rc < 0) {
-			dev_err(chip->dev, "Couldn't enable dpdm regulator rc=%d\n", rc);
-		} else {
-			chip->dpdm_enabled = true;
-			dev_info(chip->dev, "DPDM regulator enabled at probe\n");
-		}
-	}
 
 	rc = smb_init_hw(chip, match_data->init_seq, match_data->init_seq_len);
 	if (rc < 0)

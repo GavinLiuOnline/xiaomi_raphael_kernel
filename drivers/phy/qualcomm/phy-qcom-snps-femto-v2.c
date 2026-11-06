@@ -738,12 +738,10 @@ static int qcom_snps_hsphy_probe(struct platform_device *pdev)
 		}
 		dev_info(dev, "Registered dpdm regulator for charger D+/D- control\n");
 
-		/* Immediately release D+/D- lines to PMIC for APSD/QC.
-		 * The charger driver will later claim the dpdm regulator,
-		 * but we need D+/D- released as early as possible so that
-		 * PMIC autonomous APSD can detect charger type at boot.
+		/* Keep D+/D- with the PHY at probe time. The charger driver
+		 * enables this regulator only when it needs PMIC APSD/QC,
+		 * and releases it back to the PHY for USB data (SDP/CDP).
 		 */
-		qcom_snps_hsphy_dpdm_enable(rdev);
 	}
 
 	phy_provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
