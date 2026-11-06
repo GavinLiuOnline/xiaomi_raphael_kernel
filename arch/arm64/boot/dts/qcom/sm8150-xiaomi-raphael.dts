@@ -75,12 +75,16 @@
 		stdout-path = "serial0:115200n8";
 		bootargs = "earlycon console=ttyMSM0,115200";
 
-		/*
-		 * Do not expose chosen/simple-framebuffer here.
-		 * simpledrm probes it and blits uninitialized shadow-buffer
-		 * damage into 0x9c000000 (cont_splash), causing white bars.
-		 * Keep cont_splash_mem reserved for later DRM_MSM handover.
-		 */
+		framebuffer: framebuffer@9c000000 {
+			compatible = "simple-framebuffer";
+			reg = <0 0x9c000000 0 (1080 * 2340 * 4)>;
+			width = <1080>;
+			height = <2340>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+			display = <&panel>;
+			clocks = <&gcc GCC_DISP_HF_AXI_CLK>;
+		};
 	};
 
         gpio-keys {
@@ -676,7 +680,6 @@
 
 &mdss {
 	status = "okay";
-	qcom,boot-display-on;
 };
 
 &pm8150_gpios {
@@ -1413,7 +1416,6 @@
  * adequately powered until handoff.
  */
 &dispcc {
-	qcom,boot-display-on;
 	required-opps = <&rpmhpd_opp_nom>;
 	interconnects = <&mmss_noc MASTER_MDP_PORT0 0 &mc_virt SLAVE_EBI_CH0 0>,
 			<&mmss_noc MASTER_MDP_PORT1 0 &mc_virt SLAVE_EBI_CH0 0>;
