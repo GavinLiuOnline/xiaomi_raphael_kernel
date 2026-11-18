@@ -148,7 +148,18 @@ int slim_do_transfer(struct slim_controller *ctrl, struct slim_msg_txn *txn)
 	ret = ctrl->xfer_msg(ctrl, txn);
 	if (ret == -ETIMEDOUT) {
 		slim_free_txn_tid(ctrl, txn);
-	} else if (!ret && need_tid && !txn->msg->comp) {
+	} else if (ret) {
+		/*
+		 * The message was never queued, so no response will ever free
+		 * the TID.  Leaking it here ends up exhausting the TID table
+		 * (-ENOSPC) and breaks every subsequent read transaction.
+		 */
+		if (need_tid) {
+			slim_free_txn_tid(ctrl, txn);
+			/* No response is pending, drop the runtime-PM vote */
+			txn->tid = 0;
+		}
+	} else if (need_tid && !txn->msg->comp) {
 		unsigned long ms = txn->rl + HZ;
 
 		time_left = wait_for_completion_timeout(txn->comp,

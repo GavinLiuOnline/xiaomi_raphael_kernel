@@ -586,6 +586,13 @@ static int qcom_slim_ngd_tx_msg_post(struct qcom_slim_ngd_ctrl *ctrl,
 						DMA_PREP_INTERRUPT);
 	if (!desc->desc) {
 		dev_err(ctrl->dev, "unable to prepare channel\n");
+		/*
+		 * The ring slot was already taken by qcom_slim_ngd_tx_msg_get().
+		 * Give it back, otherwise it is never reclaimed (its DMA
+		 * callback will never run) and the ring fills up permanently.
+		 */
+		if (ctrl->tx_tail == (index + 1) % QCOM_SLIM_NGD_DESC_NUM)
+			ctrl->tx_tail = index;
 		spin_unlock_irqrestore(&ctrl->tx_buf_lock, flags);
 		return -EINVAL;
 	}
@@ -1711,7 +1718,13 @@ static int __maybe_unused qcom_slim_ngd_runtime_suspend(struct device *dev)
 	struct qcom_slim_ngd_ctrl *ctrl = dev_get_drvdata(dev);
 	int ret = 0;
 
-	qcom_slim_ngd_exit_dma(ctrl);
+	/*
+	 * The NGD DMA channels are only allocated in probe() and are never
+	 * re-initialised by the resume path, so releasing them here leaves the
+	 * controller unable to transmit anything once the device was runtime
+	 * suspended (even if the suspend itself fails and the device stays
+	 * active).  Keep them alive for the lifetime of the controller.
+	 */
 	if (!ctrl->qmi.handle)
 		return 0;
 
