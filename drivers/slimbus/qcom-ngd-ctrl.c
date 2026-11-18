@@ -709,8 +709,10 @@ static int qcom_slim_ngd_init_rx_msgq(struct qcom_slim_ngd_ctrl *ctrl)
 
 rx_post_err:
 	dma_free_coherent(dev, size, ctrl->rx_base, ctrl->rx_phys_base);
+	ctrl->rx_base = NULL;
 rel_rx:
 	dma_release_channel(ctrl->dma_rx_channel);
+	ctrl->dma_rx_channel = NULL;
 	return ret;
 }
 
@@ -745,6 +747,8 @@ static int qcom_slim_ngd_init_tx_msgq(struct qcom_slim_ngd_ctrl *ctrl)
 	return 0;
 rel_tx:
 	dma_release_channel(ctrl->dma_tx_channel);
+	ctrl->dma_tx_channel = NULL;
+	ctrl->tx_base = NULL;
 	return ret;
 }
 
@@ -1148,6 +1152,8 @@ static int qcom_slim_ngd_get_laddr(struct slim_controller *ctrl,
 
 static int qcom_slim_ngd_exit_dma(struct qcom_slim_ngd_ctrl *ctrl)
 {
+	struct device *dev = ctrl->dev;
+
 	if (ctrl->dma_rx_channel) {
 		dmaengine_terminate_sync(ctrl->dma_rx_channel);
 		dma_release_channel(ctrl->dma_rx_channel);
@@ -1159,6 +1165,24 @@ static int qcom_slim_ngd_exit_dma(struct qcom_slim_ngd_ctrl *ctrl)
 	}
 
 	ctrl->dma_tx_channel = ctrl->dma_rx_channel = NULL;
+
+	/*
+	 * The message queues live in DMA coherent memory handed to the BAM.
+	 * The ADSP resets the BAM while the controller is suspended, so those
+	 * buffers are stale; init_*_msgq() allocates fresh ones on resume.
+	 */
+	if (ctrl->rx_base) {
+		dma_free_coherent(dev, QCOM_SLIM_NGD_DESC_NUM * SLIM_MSGQ_BUF_LEN,
+				  ctrl->rx_base, ctrl->rx_phys_base);
+		ctrl->rx_base = NULL;
+	}
+
+	if (ctrl->tx_base) {
+		dma_free_coherent(dev,
+				  (QCOM_SLIM_NGD_DESC_NUM + 1) * SLIM_MSGQ_BUF_LEN,
+				  ctrl->tx_base, ctrl->tx_phys_base);
+		ctrl->tx_base = NULL;
+	}
 
 	return 0;
 }
@@ -1335,8 +1359,16 @@ static int qcom_slim_ngd_runtime_resume(struct device *dev)
 	if (!ctrl->qmi.handle)
 		return 0;
 
-	if (ctrl->state >= QCOM_SLIM_NGD_CTRL_ASLEEP)
+	if (ctrl->state >= QCOM_SLIM_NGD_CTRL_ASLEEP) {
+		/*
+		 * The ADSP resets the BAM together with the SLIMbus framer when
+		 * it powers down, so channels and message queues configured
+		 * before the suspend are dead.  Drop them and let
+		 * qcom_slim_ngd_setup() (called from power_up) rebuild both.
+		 */
+		qcom_slim_ngd_exit_dma(ctrl);
 		ret = qcom_slim_ngd_power_up(ctrl);
+	}
 	if (ret) {
 		/* Did SSR cause this power up failure */
 		if (ctrl->state != QCOM_SLIM_NGD_CTRL_DOWN)
