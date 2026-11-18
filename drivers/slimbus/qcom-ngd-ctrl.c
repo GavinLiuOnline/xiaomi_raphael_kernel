@@ -750,19 +750,29 @@ rel_tx:
 
 static int qcom_slim_ngd_init_dma(struct qcom_slim_ngd_ctrl *ctrl)
 {
-	int ret = 0;
+	int ret = 0, tx_ret = 0;
 
-	ret = qcom_slim_ngd_init_rx_msgq(ctrl);
-	if (ret) {
-		dev_err(ctrl->dev, "rx dma init failed\n");
-		return ret;
+	/*
+	 * DMA channels survive runtime suspend now, so this has to be
+	 * idempotent: requesting a channel we already hold fails with -EBUSY.
+	 */
+	if (!ctrl->dma_rx_channel) {
+		ret = qcom_slim_ngd_init_rx_msgq(ctrl);
+		if (ret)
+			dev_err(ctrl->dev, "rx dma init failed\n");
 	}
 
-	ret = qcom_slim_ngd_init_tx_msgq(ctrl);
-	if (ret)
-		dev_err(ctrl->dev, "tx dma init failed\n");
+	/*
+	 * A missing RX channel must not keep TX down, otherwise a capture-only
+	 * failure would also kill playback.
+	 */
+	if (!ctrl->dma_tx_channel) {
+		tx_ret = qcom_slim_ngd_init_tx_msgq(ctrl);
+		if (tx_ret)
+			dev_err(ctrl->dev, "tx dma init failed\n");
+	}
 
-	return ret;
+	return ret ? ret : tx_ret;
 }
 
 static irqreturn_t qcom_slim_ngd_interrupt(int irq, void *d)
@@ -1157,8 +1167,16 @@ static void qcom_slim_ngd_setup(struct qcom_slim_ngd_ctrl *ctrl)
 {
 	u32 cfg = readl_relaxed(ctrl->ngd->base);
 
-	if (ctrl->state == QCOM_SLIM_NGD_CTRL_DOWN ||
-		ctrl->state == QCOM_SLIM_NGD_CTRL_ASLEEP)
+	/*
+	 * The channels are no longer released on runtime suspend, so only
+	 * initialize them once. Re-requesting them on resume fails with
+	 * -EBUSY for RX and then init_dma() bails out, leaving the
+	 * controller unable to send: "Failed to request RX dma channel"
+	 * followed by endless TX -110 timeouts.
+	 */
+	if ((ctrl->state == QCOM_SLIM_NGD_CTRL_DOWN ||
+	     ctrl->state == QCOM_SLIM_NGD_CTRL_ASLEEP) &&
+	    (!ctrl->dma_rx_channel || !ctrl->dma_tx_channel))
 		qcom_slim_ngd_init_dma(ctrl);
 
 	/* By default enable message queues */
