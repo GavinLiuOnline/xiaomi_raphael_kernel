@@ -447,8 +447,14 @@ static int ctrl_cmd_del_client(struct sockaddr_qrtr *from,
 
 		ret = kernel_sendmsg(qrtr_ns.sock, &msg, &iv, 1, sizeof(pkt));
 		if (ret < 0 && ret != -ENODEV) {
-			pr_err("failed to send del client cmd\n");
-			return ret;
+			/*
+			 * This is a notification, not a request: a local server
+			 * that is gone or not draining its queue must not stop
+			 * the broadcast to the remaining servers, and must not
+			 * flood the log on every local client teardown.
+			 */
+			pr_debug("failed to send del client cmd: %d\n", ret);
+			continue;
 		}
 	}
 	return 0;
