@@ -4901,6 +4901,18 @@ static struct ieee80211_sta_vht_cap ath10k_create_vht_cap(struct ath10k *ar)
 	vht_cap.vht_supported = 1;
 	vht_cap.cap = ar->vht_cap_info;
 
+	/*
+	 * WCN3990 firmware advertises VHT160/80+80 support, but a vdev
+	 * started with such a width cannot transmit management frames:
+	 * authentication frames are never ACKed. This is especially visible
+	 * on the common 36-64 block, where 160 MHz also spans DFS channels.
+	 * The chip is a 2x2 80 MHz part, so hide the wider widths from
+	 * mac80211 to make it connect at VHT80 instead.
+	 */
+	if (QCA_REV_WCN3990(ar))
+		vht_cap.cap &= ~(IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK |
+				 IEEE80211_VHT_CAP_EXT_NSS_BW_MASK);
+
 	if (ar->vht_cap_info & (IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
 				IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE)) {
 		val = ath10k_mac_get_vht_cap_bf_sts(ar);
