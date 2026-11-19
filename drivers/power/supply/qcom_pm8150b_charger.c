@@ -405,6 +405,8 @@ struct pm8150b_chg {
 	int			usb_online;
 	int			usb_present;	/* last plug state seen */
 	int			src_type;	/* last source class reported */
+	int			src_usb_type;	/* last BC1.2 verdict */
+	bool			src_floating;	/* last verdict was floating D+/D- */
 	int			src_voltage_uv;	/* last QC class reported */
 	int			class_bad;	/* class/wire gaps in a row */
 	int			qc3_pulses;	/* QC3 steps sent so far */
@@ -1232,6 +1234,8 @@ static bool chg_update_input(struct pm8150b_chg *chg)
 		schedule_delayed_work(&chg->qc3_work, 0);
 
 	chg->src_type = src.type;
+	chg->src_usb_type = src.usb_type;
+	chg->src_floating = src.floating;
 	chg->src_voltage_uv = src.voltage_uv;
 	return changed;
 }
@@ -1885,9 +1889,10 @@ static void chg_detect_work(struct work_struct *work)
 
 	if (!charger) {
 		/* A host or an unidentified source: the pair stays with the PHY. */
+		dev_info(chg->dev, "verdict %#x is not a dedicated charger\n",
+			 result);
 		chg_hvdcp_enable(chg, false);
 		chg_dpdm_float(chg, false);
-		chg->qc_trial_done = true;
 		chg->detecting = false;
 		mod_delayed_work(system_percpu_wq, &chg->status_work, 0);
 		return;
@@ -2034,24 +2039,25 @@ static void chg_status_work(struct work_struct *work)
 	}
 
 	/*
-	 * The plug edge alone is not a usable trigger: USBIN can start
-	 * reporting the plug only after the 700 ms delay has already run,
-	 * and then nothing would ever look at the source again.  Keep
-	 * retrying from the poll until this plug has a verdict, see
-	 * chg_detect_work().
-	 */
-	if (present && !chg->detecting && !chg->qc_trial && !chg->qc_trial_done) {
-		chg->detecting = true;
-		schedule_delayed_work(&chg->detect_work, 0);
-	}
-
-	/*
 	 * The source classification is not instant: BC1.2 and the QC
 	 * handshake settle some time after the plug event, so watch it here
 	 * and let userspace know when the verdict changes.
 	 */
 	if (chg_update_input(chg))
 		changed = true;
+
+	/*
+	 * The first verdict can arrive before the charger has finished its
+	 * own detection -- it read as SDP here while the plug was still
+	 * settling -- so keep asking while the poll calls the source a
+	 * dedicated charger and no loan has been made or answered for this
+	 * plug.
+	 */
+	if (present && !chg->detecting && !chg->qc_trial && !chg->qc_trial_done &&
+	    chg->src_usb_type == POWER_SUPPLY_USB_TYPE_DCP && !chg->src_floating) {
+		chg->detecting = true;
+		schedule_delayed_work(&chg->detect_work, 0);
+	}
 
 	if (!chg_get_status(chg, &status) && status != chg->status) {
 		chg->status = status;
