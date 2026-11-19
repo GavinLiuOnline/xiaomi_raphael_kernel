@@ -278,6 +278,14 @@
 #define ICL_QC3_BOOST_UA		1000000
 
 /*
+ * D+/D- are lent to the charger only long enough to find out whether the
+ * source answers the Qualcomm handshake.  A source that never does has no
+ * use for the pair and gets it back, which keeps a data host's enumeration
+ * intact even if BC1.2 mistook its pull-up for a charger.
+ */
+#define QC_TRIAL_MS			8000
+
+/*
  * The SMB1390 charge pump is a 2:1 switched-capacitor divider: it feeds
  * the system rail at half the input voltage and draws half the charge
  * current from the adapter.  Its input limit is therefore the smaller of
@@ -415,6 +423,8 @@ struct pm8150b_chg {
 	 */
 	struct regulator	*dpdm;
 	bool			dpdm_held;
+	bool			qc_trial;	/* pair lent out, waiting for QC */
+	unsigned long		qc_trial_jiff;	/* when the loan started */
 
 	/*
 	 * The SMB1390 charge pump and the limits that go with it, see
@@ -463,6 +473,8 @@ static int chg_masked_write(struct pm8150b_chg *chg, unsigned int reg,
 }
 
 /* ----------------------- D+/D- ownership ---------------------------- */
+
+static void chg_hvdcp_enable(struct pm8150b_chg *chg, bool enable);
 
 /*
  * D+/D- are shared between the USB gadget and this charger.  The gadget
@@ -777,40 +789,56 @@ struct chg_source {
 };
 
 /*
- * The pair is held by default: a charger has nowhere to enumerate to and
- * needs D+/D- for the BC1.2 verdict and for the QC handshake that follows.
- * A source that identifies as a host gets the pair back, since the gadget
- * is the only thing that can talk to it.
+ * The pair rests with the PHY.  It is lent out exactly once per plug, by
+ * chg_detect_work(), and only on a BC1.2 verdict of a dedicated charger;
+ * this runs on every poll to give it back.
  *
- * A floating pair is neither, and is resolved in favour of the PHY, see
- * below.
+ * Giving it back matters more than it looks: while the charger owns the
+ * pair the gadget cannot enumerate, and while the gadget is enumerated a
+ * BC1.2 run reads its D+ pull-up as a charger.  Deciding ownership from a
+ * verdict taken in that state makes the two verdicts chase each other --
+ * take the pair, the gadget drops, classify as a host, give it back, the
+ * gadget enumerates, classify as a charger -- and the USB link never
+ * settles.  The verdict that starts a loan is therefore the one the
+ * hardware reached on its own at plug time, and a loan that finds no QC
+ * answer is not repeated until the next plug.
  */
 static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *src)
 {
-	bool host;
+	bool charger;
 
-	if (src->usb_type == POWER_SUPPLY_USB_TYPE_UNKNOWN)
-		return;
+	/* The handshake answered: the pair stays with the charger. */
+	if (src->qc2 || src->qc3)
+		chg->qc_trial = false;
 
-	/*
-	 * A floating verdict means BC1.2 saw nothing identify the source:
-	 * either a dumb charger, or a host that was never given the pair.
-	 * Only the PHY can tell the two apart, because a host answers a
-	 * pull-up and a dumb charger does not, so the pair is handed over
-	 * and left there.  Re-running the detection here would be wrong:
-	 * BC1.2 drives the same lines the gadget is now using, and tearing
-	 * an enumeration down to classify it again helps nobody.  Nothing
-	 * is lost for a dumb charger either, as it speaks neither BC1.2 nor
-	 * QC and keeps charging at the float limit.
-	 */
-	if (src->floating) {
-		chg_dpdm_float(chg, false);
+	if (chg->qc_trial) {
+		if (time_after(jiffies, chg->qc_trial_jiff +
+			       msecs_to_jiffies(QC_TRIAL_MS))) {
+			/*
+			 * Nothing answered the handshake, so the pair is of no
+			 * use here: a 5 V source charges fine on the buck
+			 * alone, and a misdetected host needs its enumeration
+			 * back.
+			 */
+			chg->qc_trial = false;
+			chg_hvdcp_enable(chg, false);
+			chg_dpdm_float(chg, false);
+		}
 		return;
 	}
 
-	host = src->usb_type == POWER_SUPPLY_USB_TYPE_SDP ||
-	       src->usb_type == POWER_SUPPLY_USB_TYPE_CDP;
-	chg_dpdm_float(chg, !host);
+	/*
+	 * Everything that is not a dedicated charger can enumerate us and is
+	 * given the pair: a data host, an unidentified source, and the
+	 * floating verdict BC1.2 returns when it saw nothing (a dumb charger
+	 * or a host the charger itself was blocking).  The handshake is turned
+	 * off with it, as it drives the same lines the gadget now uses.
+	 */
+	charger = src->usb_type == POWER_SUPPLY_USB_TYPE_DCP && !src->floating;
+	if (!charger) {
+		chg_hvdcp_enable(chg, false);
+		chg_dpdm_float(chg, false);
+	}
 }
 
 /*
@@ -1751,59 +1779,77 @@ static void chg_hvdcp_enable(struct pm8150b_chg *chg, bool enable)
 }
 
 /*
- * Run source detection again with the handshake turned on.  Anything that
- * was classified before this runs -- a charger already plugged in while the
- * driver loaded, say -- never gets as far as the handshake without it.
+ * Decide what a freshly plugged source is worth, once per plug: a dedicated
+ * charger gets D+/D- lent to it and the Qualcomm handshake turned on, so a
+ * QC adapter can be talked up to 9 V; anything else keeps the pair, because
+ * only the PHY can enumerate us to a data host.
  *
- * Detection drives D+/D-, so the verdict is waited out before anything
- * else may touch the pair: a QC3 burst racing a detection gets the
- * handshake torn down under it.  The verdict also lands in stages, BC1.2
- * first and the QC handshake seconds later, and only the final state may
- * be believed; see chg_read_source().
+ * BC1.2 is deliberately *not* re-run here.  The hardware runs it on its own
+ * the moment the plug event lands, before the gadget has had time to pull D+
+ * up, and that verdict is the only trustworthy one; re-running it later
+ * reads the gadget's own pull-up as a charger.  The vendor driver is just as
+ * adamant: an APSD re-run tears down the autonomous handshake it is trying
+ * to observe.
  */
 static void chg_detect_work(struct work_struct *work)
 {
 	struct pm8150b_chg *chg =
 		container_of(work, struct pm8150b_chg, detect_work.work);
 	unsigned int stat, result;
-	bool settling = false;
-	int i, present, rc;
+	bool charger;
+	int i, present = 0;
 
-	if (!chg_usb_present(chg, &present) && present) {
-		chg_hvdcp_enable(chg, true);
-
-		rc = chg_write(chg, CMD_APSD, APSD_RERUN);
-		if (rc < 0)
-			dev_warn(chg->dev,
-				 "failed to re-run source detection\n");
-
-		/*
-		 * Only a state reached after the detection has visibly been
-		 * in flight counts as final: the registers still hold the
-		 * previous verdict until the re-run takes effect.  A source
-		 * that speaks no QC settles as soon as BC1.2 is done and the
-		 * QC check has timed out; a QC one only once authenticated.
-		 */
-		for (i = 0; i < 50; i++) {
-			if (chg_read(chg, APSD_STATUS, &stat) ||
-			    chg_read(chg, APSD_RESULT_STATUS, &result))
-				break;
-
-			if (!(stat & APSD_DTC_DONE)) {
-				settling = true;
-			} else if (settling &&
-				   (!(result & (DCP_CHARGER | OCP_CHARGER)) ||
-				    (stat & HVDCP_CHECK_TIMEOUT)) &&
-				   (!(stat & QC_CHARGER) ||
-				    (stat & QC_AUTH_DONE))) {
-				break;
-			}
-
-			msleep(200);
-		}
+	if (chg_usb_present(chg, &present) || !present) {
+		chg->detecting = false;
+		return;
 	}
 
-	chg->detecting = delayed_work_pending(&chg->detect_work);
+	if (chg_read(chg, APSD_STATUS, &stat) ||
+	    chg_read(chg, APSD_RESULT_STATUS, &result)) {
+		chg->detecting = false;
+		return;
+	}
+
+	charger = (stat & APSD_DTC_DONE) &&
+		  (result & (DCP_CHARGER | OCP_CHARGER));
+
+	if (!charger) {
+		/* A host or an unidentified source: the pair stays with the PHY. */
+		chg_hvdcp_enable(chg, false);
+		chg_dpdm_float(chg, false);
+		chg->detecting = false;
+		mod_delayed_work(system_percpu_wq, &chg->status_work, 0);
+		return;
+	}
+
+	/*
+	 * The pair is only worth taking for the handshake, and only until the
+	 * trial in chg_dpdm_policy() runs out; the current limits elsewhere
+	 * keep a 5 V source charging either way.
+	 */
+	chg_dpdm_float(chg, true);
+	chg_hvdcp_enable(chg, true);
+	chg->qc_trial = true;
+	chg->qc_trial_jiff = jiffies;
+
+	/*
+	 * The handshake runs autonomously in hardware once armed; wait for it
+	 * to authenticate so the QC3 burst cannot start against a handshake
+	 * still in formation.  A source that does not answer is picked up by
+	 * the trial timeout instead.
+	 */
+	chg->detecting = true;
+	for (i = 0; i < 15; i++) {
+		if (chg_usb_present(chg, &present) || !present)
+			break;
+		if (chg_read(chg, APSD_STATUS, &stat))
+			break;
+		if ((stat & QC_CHARGER) && (stat & QC_AUTH_DONE))
+			break;
+		msleep(200);
+	}
+
+	chg->detecting = false;
 	mod_delayed_work(system_percpu_wq, &chg->status_work, 0);
 }
 
@@ -1888,19 +1934,22 @@ static void chg_status_work(struct work_struct *work)
 	}
 
 	/*
-	 * When a source appears, take D+/D- over from the gadget and run the
-	 * QC handshake over the classification once the input has settled;
-	 * see chg_detect_work().  Nothing needs poking on the way out beyond
-	 * dropping the handshake again, and the pair can rest where it is
-	 * until the next source shows up.
+	 * A fresh plug starts with D+/D- resting in the PHY and with no loan
+	 * outstanding; chg_detect_work() decides once, from the verdict the
+	 * hardware reached on its own, whether the pair is worth taking, see
+	 * chg_dpdm_policy().  A plug out ends any loan at once.
 	 */
 	if (!chg_usb_present(chg, &present) && present != chg->usb_present) {
-		chg_dpdm_float(chg, true);
 		if (present) {
+			chg->qc_trial = false;
 			chg->detecting = true;
 			schedule_delayed_work(&chg->detect_work,
 					      msecs_to_jiffies(700));
 		} else {
+			cancel_delayed_work(&chg->detect_work);
+			chg->detecting = false;
+			chg->qc_trial = false;
+			chg_dpdm_float(chg, false);
 			chg_cp_disable(chg);
 			chg_hvdcp_enable(chg, false);
 			cancel_delayed_work_sync(&chg->qc3_work);
@@ -2030,8 +2079,13 @@ static void chg_status_work(struct work_struct *work)
 	 * must stay fast and non-blocking.  Come back quickly until the
 	 * first sample lands and while the cell is outside its safe range,
 	 * where prompt action matters; a half-minute is plenty otherwise.
+	 * A loan of D+/D- is watched closely: it is short, and the pair must
+	 * be given back the moment the handshake is known not to answer.
 	 */
-	delay_ms = (chg->temp_valid && !chg->temp_bad) ? 30000 : 5000;
+	if (chg->qc_trial)
+		delay_ms = 1000;
+	else
+		delay_ms = (chg->temp_valid && !chg->temp_bad) ? 30000 : 5000;
 	schedule_delayed_work(&chg->status_work,
 			      round_jiffies_relative(msecs_to_jiffies(delay_ms)));
 }
@@ -2277,10 +2331,11 @@ static int chg_hw_init(struct pm8150b_chg *chg)
 		return rc;
 
 	/*
-	 * Re-run detection with the QC handshake on: a source plugged in
-	 * before the driver loaded is otherwise never handshaked.  It is
-	 * queued ahead of the input update so a stale verdict cannot start
-	 * the QC3 boost before the fresh detection has had the pair.
+	 * Look at the source that is already attached, if any: the probe may
+	 * well run long after the cable was plugged, and the verdict has been
+	 * sitting in the APSD registers since then.  It is queued ahead of the
+	 * input update so a stale verdict cannot start the QC3 boost before
+	 * the pair has been dealt with.
 	 */
 	chg->detecting = true;
 	schedule_delayed_work(&chg->detect_work, msecs_to_jiffies(700));
