@@ -26,6 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
@@ -803,6 +804,24 @@ struct chg_source {
  * hardware reached on its own at plug time, and a loan that finds no QC
  * answer is not repeated until the next plug.
  */
+/*
+ * The BSP brings the NCM gadget up as "usb0".  Once that netdev exists a
+ * host may enumerate us at any moment, and the charger has to keep its
+ * hands off D+/D-: the gadget's own D+ pull-up makes BC1.2 read whatever is
+ * plugged in as a dedicated charger, and driving the pair for QC then
+ * destroys the link the gadget is already using.
+ */
+static bool chg_data_role_in_use(void)
+{
+	struct net_device *nd = dev_get_by_name(&init_net, "usb0");
+
+	if (!nd)
+		return false;
+
+	dev_put(nd);
+	return true;
+}
+
 static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *src)
 {
 	bool charger;
@@ -823,6 +842,7 @@ static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *sr
 			chg->qc_trial = false;
 			chg_hvdcp_enable(chg, false);
 			chg_dpdm_float(chg, false);
+			dev_info(chg->dev, "QC went unanswered, D+/D- back to the PHY\n");
 		}
 		return;
 	}
@@ -1813,6 +1833,18 @@ static void chg_detect_work(struct work_struct *work)
 	charger = (stat & APSD_DTC_DONE) &&
 		  (result & (DCP_CHARGER | OCP_CHARGER));
 
+	/*
+	 * A verdict taken while the gadget is already enumerated says nothing
+	 * about what is plugged in: BC1.2 sees our own D+ pull-up.  Take the
+	 * pair only when no data role is up.
+	 */
+	if (charger && chg_data_role_in_use()) {
+		dev_info(chg->dev,
+			 "verdict %#x looks like a charger but the USB data role is up, leaving D+/D- with the PHY\n",
+			 result);
+		charger = false;
+	}
+
 	if (!charger) {
 		/* A host or an unidentified source: the pair stays with the PHY. */
 		chg_hvdcp_enable(chg, false);
@@ -1831,6 +1863,7 @@ static void chg_detect_work(struct work_struct *work)
 	chg_hvdcp_enable(chg, true);
 	chg->qc_trial = true;
 	chg->qc_trial_jiff = jiffies;
+	dev_info(chg->dev, "lending D+/D- to the charger for a QC trial\n");
 
 	/*
 	 * The handshake runs autonomously in hardware once armed; wait for it
