@@ -410,6 +410,7 @@ struct pm8150b_chg {
 	int			qc3_pulses;	/* QC3 steps sent so far */
 	bool			qc3_boosting;	/* QC3 burst owns the input limit */
 	bool			detecting;	/* source detection drives D+/D- */
+	bool			qc_trial_done;	/* a loan was already tried this plug */
 	int			capacity;
 	int			temp_deci;
 	bool			temp_valid;
@@ -836,8 +837,10 @@ static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *sr
 	bool charger;
 
 	/* The handshake answered: the pair stays with the charger. */
-	if (src->qc2 || src->qc3)
+	if (src->qc2 || src->qc3) {
 		chg->qc_trial = false;
+		chg->qc_trial_done = true;
+	}
 
 	if (chg->qc_trial) {
 		if (time_after(jiffies, chg->qc_trial_jiff +
@@ -849,6 +852,7 @@ static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *sr
 			 * back.
 			 */
 			chg->qc_trial = false;
+			chg->qc_trial_done = true;
 			chg_hvdcp_enable(chg, false);
 			chg_dpdm_float(chg, false);
 			dev_info(chg->dev, "QC went unanswered, D+/D- back to the PHY\n");
@@ -1834,6 +1838,8 @@ static void chg_detect_work(struct work_struct *work)
 		return;
 	}
 
+	dev_info(chg->dev, "looking at the plugged source\n");
+
 	/*
 	 * BC1.2 does not finish the instant the plug lands; a charger that
 	 * also has to answer the QC handshake takes longer still.  Reading
@@ -1874,12 +1880,14 @@ static void chg_detect_work(struct work_struct *work)
 			 "verdict %#x looks like a charger but the USB data role is up, leaving D+/D- with the PHY\n",
 			 result);
 		charger = false;
+		chg->qc_trial_done = true;
 	}
 
 	if (!charger) {
 		/* A host or an unidentified source: the pair stays with the PHY. */
 		chg_hvdcp_enable(chg, false);
 		chg_dpdm_float(chg, false);
+		chg->qc_trial_done = true;
 		chg->detecting = false;
 		mod_delayed_work(system_percpu_wq, &chg->status_work, 0);
 		return;
@@ -1989,7 +1997,7 @@ static void chg_status_work(struct work_struct *work)
 	bool allow = true;
 	bool want_cp;
 	unsigned int delay_ms;
-	int status, online, present, capacity, temp;
+	int status, online, present = 0, capacity, temp;
 	int current_ua;
 
 	if (!chg_usb_online(chg, &online) && online != chg->usb_online) {
@@ -2006,6 +2014,7 @@ static void chg_status_work(struct work_struct *work)
 	if (!chg_usb_present(chg, &present) && present != chg->usb_present) {
 		if (present) {
 			chg->qc_trial = false;
+			chg->qc_trial_done = false;
 			chg->detecting = true;
 			schedule_delayed_work(&chg->detect_work,
 					      msecs_to_jiffies(700));
@@ -2013,6 +2022,7 @@ static void chg_status_work(struct work_struct *work)
 			cancel_delayed_work(&chg->detect_work);
 			chg->detecting = false;
 			chg->qc_trial = false;
+			chg->qc_trial_done = false;
 			chg_dpdm_float(chg, false);
 			chg_cp_disable(chg);
 			chg_hvdcp_enable(chg, false);
@@ -2021,6 +2031,18 @@ static void chg_status_work(struct work_struct *work)
 		}
 		chg->usb_present = present;
 		changed = true;
+	}
+
+	/*
+	 * The plug edge alone is not a usable trigger: USBIN can start
+	 * reporting the plug only after the 700 ms delay has already run,
+	 * and then nothing would ever look at the source again.  Keep
+	 * retrying from the poll until this plug has a verdict, see
+	 * chg_detect_work().
+	 */
+	if (present && !chg->detecting && !chg->qc_trial && !chg->qc_trial_done) {
+		chg->detecting = true;
+		schedule_delayed_work(&chg->detect_work, 0);
 	}
 
 	/*
