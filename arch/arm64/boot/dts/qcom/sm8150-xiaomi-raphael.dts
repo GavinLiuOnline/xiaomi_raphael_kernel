@@ -57,14 +57,36 @@
 
 		/*
 		 * Android: qcom,usb-icl-ua=2.8A, qcom,fcc-max-ua=5.1A (with SMB1390 CP).
-		 * Without charge pump: FCC capped at 3A (~15–18W at 9V PD).
-		 * With SMB1390 active, qcom_smbx raises FCC to min(2×ICL, 5.1A).
+		 * JEITA breakpoints are in decidegrees Celsius, step charging in
+		 * microvolts; both ask for microamps and only ever lower the
+		 * maxima above.  The one exception is the charge pump ceiling:
+		 * while the pump carries the charge the cell may take the pump's
+		 * own current instead of the buck limit.
 		 */
-		constant-charge-current-max-microamp = <3000000>;
+		constant-charge-current-max-microamp = <3200000>;
+		constant-charge-voltage-max-microvolt = <4400000>;
 
 		charge-full-design-microamp-hours = <4000000>;
 		voltage-min-design-microvolt = <3400000>;
 		voltage-max-design-microvolt = <4400000>;
+
+		qcom,charge-pump-fcc-ua = <5100000>;
+
+		qcom,jeita-fcc-ranges = <0    50  390000
+					 51   100 1100000
+					 101  150 2700000
+					 151  450 5100000
+					 451  580 1900000>;
+		qcom,jeita-fv-ranges = <0    50  4400000
+				       51   100 4400000
+				       101  150 4400000
+				       151  450 4400000
+				       451  580 4100000>;
+		qcom,step-chg-ranges = <3000000 3100000 1000000
+					3101000 3200000 1000000
+					3201000 3300000 1000000
+					3301000 4200000 5100000
+					4201000 4400000 4000000>;
 	};
 
 	chosen {
@@ -641,17 +663,25 @@
 
 /*
  * APPS_I2C (GPIO51/52 qup4) — Android qupv3_se4. SMB1390 charge pump @ 0x10.
+ *
+ * The pump offers its switcher as a regulator for the PM8150B charger to
+ * arm.  Its fault wire goes to PM8150B gpio6 (the vendor's "smb_stat" pin)
+ * and reports low; the chip's own interrupt block says which protection
+ * tripped.
  */
 &i2c4 {
 	clock-frequency = <400000>;
 	status = "okay";
 
-	smb1390: charger@10 {
-		compatible = "qcom,smb1390-charger";
+	smb1390: charge-pump@10 {
+		compatible = "qcom,smb1390";
 		reg = <0x10>;
 		interrupt-parent = <&pm8150b_gpios>;
-		interrupts = <6 IRQ_TYPE_EDGE_FALLING>;
-		qcom,primary-charger = <&pm8150b_charger>;
+		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&smb_stat_default>;
+		regulator-min-microamp = <500000>;
+		regulator-max-microamp = <3600000>;
 		status = "okay";
 	};
 };
@@ -784,20 +814,72 @@
 	};
 };
 
-&pm8150b_fg {
-	status = "okay";
-	monitored-battery = <&battery>;
-	power-supplies = <&pm8150b_charger>, <&smb1390>;
-};
-
 &usb_1_hsphy {
 	status = "okay";
 };
 
+/*
+ * PM8150B SMB5 charger and GEN4 fuel gauge.
+ *
+ * The float voltage comes from the battery description above and is the
+ * battery's 4.4 V maximum, which is the primary over-charge protection: the
+ * hardware stops charging there whatever the software does.  The input
+ * current limit is left to the charger's own source detection, so a plain
+ * USB port is never asked for more than it advertised.
+ *
+ * The GEN4 gauge is part of the same driver, so &pm8150b_fg stays disabled:
+ * a second "battery" power supply would clash with this one.
+ */
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
+
+	/*
+	 * The charger driver needs the plug, source-change and state-change
+	 * interrupts by name.  The PMIC dtsi predates this binding and only
+	 * describes "usb-plugin"/"usbin-icl-change"/..., so replace the list
+	 * here rather than in the shared node.
+	 */
+	interrupts = <0x2 0x10 0x1 IRQ_TYPE_EDGE_RISING>,
+		     <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
+		     <0x2 0x13 0x6 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "chg-state-change",
+			  "usbin-plugin",
+			  "usbin-src-change";
+
+	/* The SMB1390 pump takes over the charge path at the 9 V input class. */
+	charge-pump-supply = <&smb1390>;
+
+	/*
+	 * The measured input voltage.  The QC class says what was asked of the
+	 * adapter; this says what the wire really carries, and the pump is
+	 * only started on the two agreeing.
+	 */
+	io-channels = <&pm8150b_adc ADC5_USB_IN_V_16>;
+	io-channel-names = "vbus";
+
+	/*
+	 * BC1.2 and the QC handshake watch and drive the D+/D- pair the USB
+	 * gadget uses, so the charger takes the pair for as long as it needs
+	 * it; the HS PHY's dpdm regulator hands it over.  A source that turns
+	 * out to be a host gets the pair back for the gadget.
+	 */
 	dpdm-supply = <&dpdm_reg>;
+};
+
+/*
+ * PM8150B gpio6 is the SMB1390 charge pump's fault wire, pulled up and left
+ * as an input; the vendor calls the pin smb_stat.
+ */
+&pm8150b_gpios {
+	smb_stat_default: smb-stat-default-state {
+		pins = "gpio6";
+		function = "normal";
+		input-enable;
+		bias-pull-up;
+		qcom,pull-up-strength = <PMIC_GPIO_PULL_UP_30>;
+		power-source = <0>;
+	};
 };
 
 &pm8150b_vbus {

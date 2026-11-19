@@ -1674,13 +1674,6 @@ struct smb_match_data pm660_match_data = {
 	.gen = SMB2,
 };
 
-struct smb_match_data pm8150b_match_data = {
-	.init_seq = smb5_init_seq,
-	.init_seq_len = ARRAY_SIZE(smb5_init_seq),
-	.name = "pm8150b",
-	.gen = SMB5,
-};
-
 struct smb_match_data pm7250b_match_data = {
 	.init_seq = smb5_init_seq,
 	.init_seq_len = ARRAY_SIZE(smb5_init_seq),
@@ -1908,7 +1901,6 @@ static const struct of_device_id smb_match_id_table[] = {
 	{ .compatible = "qcom,pmi8998-charger", .data = &pmi8998_match_data },
 	{ .compatible = "qcom,pm660-charger", .data = &pm660_match_data },
 	{ .compatible = "qcom,pm7250b-charger", .data = &pm7250b_match_data },
-	{ .compatible = "qcom,pm8150b-charger", .data = &pm8150b_match_data },
 	{ /* sentinal */ }
 };
 MODULE_DEVICE_TABLE(of, smb_match_id_table);
