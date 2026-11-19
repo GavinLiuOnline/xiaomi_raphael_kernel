@@ -814,12 +814,21 @@ struct chg_source {
 static bool chg_data_role_in_use(void)
 {
 	struct net_device *nd = dev_get_by_name(&init_net, "usb0");
+	bool in_use;
 
 	if (!nd)
 		return false;
 
+	/*
+	 * The netdev exists for as long as the gadget is bound to its UDC,
+	 * cable or no cable, so its presence says nothing.  The link does:
+	 * only an enumerated host brings the carrier up, while a charger
+	 * leaves us in the default state with the carrier down.  That is
+	 * exactly the case where the pair is ours to borrow.
+	 */
+	in_use = netif_running(nd) && netif_carrier_ok(nd);
 	dev_put(nd);
-	return true;
+	return in_use;
 }
 
 static void chg_dpdm_policy(struct pm8150b_chg *chg, const struct chg_source *src)
@@ -1815,23 +1824,45 @@ static void chg_detect_work(struct work_struct *work)
 {
 	struct pm8150b_chg *chg =
 		container_of(work, struct pm8150b_chg, detect_work.work);
-	unsigned int stat, result;
+	unsigned int stat = 0, result = 0;
 	bool charger;
 	int i, present = 0;
+	int rc;
 
 	if (chg_usb_present(chg, &present) || !present) {
 		chg->detecting = false;
 		return;
 	}
 
-	if (chg_read(chg, APSD_STATUS, &stat) ||
-	    chg_read(chg, APSD_RESULT_STATUS, &result)) {
+	/*
+	 * BC1.2 does not finish the instant the plug lands; a charger that
+	 * also has to answer the QC handshake takes longer still.  Reading
+	 * the verdict too early drops the result silently and the source is
+	 * then treated as a five-volt host for the rest of the plug, so give
+	 * the hardware a couple of seconds before believing it.
+	 */
+	for (i = 0; i < 30; i++) {
+		if (chg_usb_present(chg, &present) || !present) {
+			rc = -ENODEV;
+			break;
+		}
+		rc = chg_read(chg, APSD_STATUS, &stat);
+		if (!rc)
+			rc = chg_read(chg, APSD_RESULT_STATUS, &result);
+		if (rc || (stat & APSD_DTC_DONE))
+			break;
+		msleep(100);
+	}
+
+	if (rc || !(stat & APSD_DTC_DONE)) {
+		dev_info(chg->dev,
+			 "no BC1.2 verdict yet (apsd %#x), leaving the pair with the PHY\n",
+			 stat);
 		chg->detecting = false;
 		return;
 	}
 
-	charger = (stat & APSD_DTC_DONE) &&
-		  (result & (DCP_CHARGER | OCP_CHARGER));
+	charger = result & (DCP_CHARGER | OCP_CHARGER);
 
 	/*
 	 * A verdict taken while the gadget is already enumerated says nothing
